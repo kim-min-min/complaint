@@ -1,0 +1,119 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: complaint-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: complaint
+      POSTGRES_USER: complaint
+      POSTGRES_PASSWORD: complaint
+    ports:
+      - "5432:5432"
+    volumes:
+      - complaint_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U complaint -d complaint"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: complaint-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: complaint
+      RABBITMQ_DEFAULT_PASS: complaint
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    container_name: complaint-backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://complaint:complaint@postgres:5432/complaint
+      CELERY_BROKER_URL: amqp://complaint:complaint@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: rpc://
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: complaint-frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_BASE_URL: ""
+      VITE_PROXY_TARGET: http://backend:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    command: npm run dev -- --host 0.0.0.0
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: complaint-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      - frontend
+      - backend
+
+  celery-worker:
+    build:
+      context: ./backend
+    container_name: complaint-celery-worker
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://complaint:complaint@postgres:5432/complaint
+      CELERY_BROKER_URL: amqp://complaint:complaint@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: rpc://
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: celery -A celery_app.celery_app worker --loglevel=info
+
+  celery-beat:
+    build:
+      context: ./backend
+    container_name: complaint-celery-beat
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://complaint:complaint@postgres:5432/complaint
+      CELERY_BROKER_URL: amqp://complaint:complaint@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: rpc://
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: celery -A celery_app.celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+
+volumes:
+  complaint_postgres_data:

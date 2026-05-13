@@ -1,19 +1,29 @@
-# 1. 사용자 요청: data 폴더 전체 제외
+# Data
 data/
 
-# 2. Python (Backend) 관련 제외
-backend/venv/
-backend/__pycache__/
-backend/*.pyc
+# Secrets
+.env
+.env.*
 backend/.env
+backend/.env.*
+frontend/.env
+frontend/.env.*
 
-# 3. React (Frontend) 관련 제외
+# Python / backend
+backend/venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+backend/celerybeat-schedule*
+
+# Node / frontend
 frontend/node_modules/
 frontend/dist/
-frontend/.env.local
-frontend/.env
 
-# 4. 기타 시스템 파일
+# Logs
+*.log
+
+# Editor / OS
 .DS_Store
 Thumbs.db
 .vscode/

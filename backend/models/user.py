@@ -1,4 +1,5 @@
 from sqlalchemy import Column, Integer, String, BigInteger, DateTime
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from database import Base
 
@@ -19,4 +20,8 @@ class User(Base):
     
     # 가입 및 수정 시간 자동 기록
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    complaints = relationship("Complaint", back_populates="user")
+    ai_jobs = relationship("AiJob", back_populates="user")
+    ai_usage_logs = relationship("AiUsageLog", back_populates="user")

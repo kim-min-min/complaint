@@ -1,24 +1,43 @@
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import declarative_base
 
-# 1. URL에 '+asyncpg'를 붙여 비동기 드라이버를 사용한다고 명시합니다.
-SQLALCHEMY_DATABASE_URL = "postgresql+asyncpg://user:password@localhost:5432/complaint_db"
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(ENV_PATH)
 
-# 2. create_engine 대신 create_async_engine을 사용합니다.
-engine = create_async_engine(SQLALCHEMY_DATABASE_URL, echo=True) # echo=True를 주면 쿼리 로그가 찍힙니다.
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+asyncpg://complaint:complaint@127.0.0.1:5432/complaint",
+)
+DATABASE_ECHO = os.getenv("DATABASE_ECHO", "false").lower() == "true"
 
-# 3. 비동기 세션을 생성하는 팩토리를 만듭니다.
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=DATABASE_ECHO,
+    pool_pre_ping=True,
+)
+
 AsyncSessionLocal = async_sessionmaker(
-    bind=engine, 
-    class_=AsyncSession, 
-    autocommit=False, 
-    autoflush=False
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autocommit=False,
+    autoflush=False,
 )
 
 Base = declarative_base()
 
-# 4. 의존성 주입 함수도 비동기(async def)로 변경합니다.
+
 async def get_db():
     async with AsyncSessionLocal() as db:
         yield db
-        # async with 블록을 벗어나면 자동으로 세션이 안전하게 종료(close)됩니다.
+
+
+async def check_database_connection() -> bool:
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+    return True
