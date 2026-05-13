@@ -1,33 +1,9 @@
-import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
 
 export default function AuthBar() {
   const navigate = useNavigate();
-  const [user, setUser] = useState(null);
-
-  useEffect(() => {
-    let ignore = false;
-
-    async function loadUser() {
-      try {
-        const response = await fetch(`${API_BASE_URL}/api/auth/me`, {
-          credentials: 'include',
-        });
-        if (!response.ok) return;
-        const data = await response.json();
-        if (!ignore) setUser(data);
-      } catch {
-        if (!ignore) setUser(null);
-      }
-    }
-
-    loadUser();
-    return () => {
-      ignore = true;
-    };
-  }, []);
 
   const handleLogout = async () => {
     await fetch(`${API_BASE_URL}/api/auth/logout`, {
@@ -38,8 +14,7 @@ export default function AuthBar() {
   };
 
   return (
-    <div className="mb-6 flex items-center justify-end gap-3 text-sm text-slate-600">
-      {user?.nickname && <span className="font-semibold text-slate-700">{user.nickname}</span>}
+    <div className="mb-6 flex items-center justify-end text-sm text-slate-600">
       <button
         type="button"
         onClick={handleLogout}
