@@ -3,16 +3,14 @@ services:
     image: pgvector/pgvector:pg16
     container_name: complaint-postgres
     restart: unless-stopped
-    environment:
-      POSTGRES_DB: complaint
-      POSTGRES_USER: complaint
-      POSTGRES_PASSWORD: complaint
+    env_file:
+      - ./backend/.env
     ports:
       - "5432:5432"
     volumes:
       - complaint_postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U complaint -d complaint"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -21,9 +19,8 @@ services:
     image: rabbitmq:3-management-alpine
     container_name: complaint-rabbitmq
     restart: unless-stopped
-    environment:
-      RABBITMQ_DEFAULT_USER: complaint
-      RABBITMQ_DEFAULT_PASS: complaint
+    env_file:
+      - ./backend/.env
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -40,10 +37,6 @@ services:
     restart: unless-stopped
     env_file:
       - ./backend/.env
-    environment:
-      DATABASE_URL: postgresql+asyncpg://complaint:complaint@postgres:5432/complaint
-      CELERY_BROKER_URL: amqp://complaint:complaint@rabbitmq:5672//
-      CELERY_RESULT_BACKEND: rpc://
     ports:
       - "8000:8000"
     depends_on:
@@ -86,10 +79,6 @@ services:
     restart: unless-stopped
     env_file:
       - ./backend/.env
-    environment:
-      DATABASE_URL: postgresql+asyncpg://complaint:complaint@postgres:5432/complaint
-      CELERY_BROKER_URL: amqp://complaint:complaint@rabbitmq:5672//
-      CELERY_RESULT_BACKEND: rpc://
     depends_on:
       postgres:
         condition: service_healthy
@@ -104,10 +93,6 @@ services:
     restart: unless-stopped
     env_file:
       - ./backend/.env
-    environment:
-      DATABASE_URL: postgresql+asyncpg://complaint:complaint@postgres:5432/complaint
-      CELERY_BROKER_URL: amqp://complaint:complaint@rabbitmq:5672//
-      CELERY_RESULT_BACKEND: rpc://
     depends_on:
       postgres:
         condition: service_healthy
