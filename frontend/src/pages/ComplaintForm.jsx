@@ -68,21 +68,21 @@ export default function ComplaintForm() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 px-4 py-8 text-left text-slate-900">
+    <div className="min-h-screen bg-[#f7f8f5] px-4 py-8 text-left text-[#111111]">
       <main className="mx-auto max-w-3xl">
         <AuthBar />
         <header className="mb-8">
-          <p className="text-sm font-semibold text-blue-700">빠른 고소장 초안</p>
-          <h1 className="mt-2 text-3xl font-bold tracking-normal text-slate-950">일단 아는 내용만 적어도 초안을 만들어드립니다</h1>
-          <p className="mt-3 text-sm leading-6 text-slate-600">사기, 폭행, 명예훼손 등 사건 종류를 몰라도 괜찮습니다. 제출용 개인정보는 미리보기 후 보완할 수 있습니다.</p>
+          <p className="text-sm font-semibold text-[#50534e]">고소장 초안</p>
+          <h1 className="mt-2 text-3xl font-semibold tracking-normal text-[#111111]">아는 내용부터 적어주세요</h1>
+          <p className="mt-3 text-sm leading-6 text-[#5f625d]">사건 종류를 몰라도 괜찮습니다. 필요한 내용은 다음 단계에서 함께 정리합니다.</p>
           {usage && (
-            <p className="mt-3 inline-flex rounded-md border border-blue-100 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-800">
+            <p className="mt-3 inline-flex rounded-full border border-[#d7d9d2] bg-[#eef2e8] px-4 py-2 text-sm font-semibold text-[#3d4a35]">
               오늘 남은 AI 요청 {usage.remaining}회 / {usage.limit}회
             </p>
           )}
         </header>
 
-        <form onSubmit={handleSubmit} className="space-y-5 rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+        <form onSubmit={handleSubmit} className="space-y-5 rounded-[6px] border border-[#d7d9d2] bg-[#fbfbf8] p-6 shadow-[0_22px_60px_rgba(30,32,27,0.08)]">
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <Field label="내 이름" name="complainantName" value={formData.complainantName} onChange={handleChange} placeholder="예: 홍길동" required />
             <Field label="상대방 이름/닉네임" name="accusedName" value={formData.accusedName} onChange={handleChange} placeholder="모르면 성명불상" required />
@@ -99,8 +99,8 @@ export default function ComplaintForm() {
 
           {error && <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
 
-          <p className="text-center text-xs leading-5 text-slate-500">생성 결과는 개인정보 보호를 위해 자동 삭제됩니다.</p>
-          <button type="submit" className="w-full rounded-lg bg-blue-700 px-4 py-3 text-base font-bold text-white transition hover:bg-blue-800">
+          <p className="text-center text-xs leading-5 text-[#64675f]">생성 결과는 개인정보 보호를 위해 자동 삭제됩니다.</p>
+          <button type="submit" className="w-full rounded-full bg-[#111111] px-4 py-3 text-base font-semibold text-white transition hover:bg-[#30302d]">
             참고자료 선택하기
           </button>
         </form>
@@ -112,8 +112,8 @@ export default function ComplaintForm() {
 function Field({ label, ...props }) {
   return (
     <label className="block">
-      <span className="mb-1 block text-sm font-semibold text-slate-700">{label}</span>
-      <input {...props} className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none transition focus:border-blue-600 focus:ring-2 focus:ring-blue-100" />
+      <span className="mb-1 block text-sm font-semibold text-[#32342f]">{label}</span>
+      <input {...props} className="w-full rounded-[4px] border border-[#d7d9d2] bg-white px-3 py-2 text-sm text-[#111111] outline-none transition placeholder:text-[#8b8e86] focus:border-[#111111] focus:ring-2 focus:ring-[#e9efe3]" />
     </label>
   );
 }
@@ -121,8 +121,8 @@ function Field({ label, ...props }) {
 function TextArea({ label, ...props }) {
   return (
     <label className="block">
-      <span className="mb-1 block text-sm font-semibold text-slate-700">{label}</span>
-      <textarea {...props} className="w-full resize-y rounded-md border border-slate-300 px-3 py-2 text-sm leading-6 outline-none transition focus:border-blue-600 focus:ring-2 focus:ring-blue-100" />
+      <span className="mb-1 block text-sm font-semibold text-[#32342f]">{label}</span>
+      <textarea {...props} className="w-full resize-y rounded-[4px] border border-[#d7d9d2] bg-white px-3 py-2 text-sm leading-6 text-[#111111] outline-none transition placeholder:text-[#8b8e86] focus:border-[#111111] focus:ring-2 focus:ring-[#e9efe3]" />
     </label>
   );
 }

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import LandingPage from './pages/LandingPage';
 import LoginPage from './pages/LoginPage';
 import KakaoCallback from './pages/KakaoCallback';
 import ComplaintForm from './pages/ComplaintForm';
@@ -48,7 +49,7 @@ function App() {
   return (
     <BrowserRouter>
       <Routes>
-        <Route path="/" element={<ProtectedRoute><ComplaintForm /></ProtectedRoute>} />
+        <Route path="/" element={<LandingPage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/auth/kakao/callback" element={<KakaoCallback />} />
         <Route path="/form" element={<ProtectedRoute><ComplaintForm /></ProtectedRoute>} />

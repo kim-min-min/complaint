@@ -29,7 +29,7 @@ function PolicyLayout({ title, children }) {
   return (
     <div className="min-h-screen bg-slate-50 px-4 py-10 text-slate-900">
       <main className="mx-auto max-w-3xl rounded-lg border border-slate-200 bg-white p-6 shadow-sm md:p-8">
-        <Link to="/login" className="text-sm font-semibold text-blue-700 hover:underline">로그인으로 돌아가기</Link>
+        <Link to="/" className="text-sm font-semibold text-blue-700 hover:underline">처음으로 돌아가기</Link>
         <h1 className="mt-5 text-3xl font-bold tracking-normal text-slate-950">{title}</h1>
         <div className="mt-8 space-y-7">{children}</div>
       </main>
