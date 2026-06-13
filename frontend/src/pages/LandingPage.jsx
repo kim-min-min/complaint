@@ -1,6 +1,41 @@
-import { Link } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
 
 export default function LandingPage() {
+  const navigate = useNavigate();
+  const [checkingAuth, setCheckingAuth] = useState(true);
+
+  useEffect(() => {
+    let ignore = false;
+
+    async function checkAuth() {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/auth/me`, {
+          credentials: 'include',
+        });
+        if (ignore) return;
+        if (response.ok) {
+          navigate('/form', { replace: true });
+          return;
+        }
+      } catch {
+        // 비로그인 상태와 동일하게 랜딩 페이지를 보여줍니다.
+      }
+      if (!ignore) setCheckingAuth(false);
+    }
+
+    checkAuth();
+    return () => {
+      ignore = true;
+    };
+  }, [navigate]);
+
+  if (checkingAuth) {
+    return <div className="min-h-screen bg-[#f7f8f5]" />;
+  }
+
   return (
     <div className="min-h-screen bg-[#f7f8f5] text-[#111111]">
       <header className="mx-auto flex w-full max-w-7xl items-center px-5 py-5 sm:px-8 lg:px-10">

@@ -14,7 +14,7 @@ celery_app = Celery(
     "complaint_backend",
     broker=CELERY_BROKER_URL,
     backend=CELERY_RESULT_BACKEND,
-    include=["tasks.complaint_tasks", "tasks.maintenance_tasks"],
+    include=["tasks.complaint_tasks", "tasks.reference_tasks", "tasks.maintenance_tasks"],
 )
 
 celery_app.conf.update(

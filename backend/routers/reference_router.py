@@ -2,20 +2,25 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
-from models.ai_usage_log import AiUsageLog
-from schemas.complaint import ReferenceSearchRequest, ReferenceSearchResponse
+from schemas.complaint import ReferenceJobCreateResponse, ReferenceJobStatusResponse, ReferenceSearchRequest
 from services.auth_service import get_current_user
-from services.reference_service import infer_charge_candidates, search_references
-from services.usage_service import DailyUsageLimitExceeded, ensure_daily_usage_available, get_today_usage_summary, new_usage_log
+from services.job_service import create_reference_job, get_job, json_result_from_job
+from services.usage_service import DailyUsageLimitExceeded, get_today_usage_summary
+from tasks.reference_tasks import process_reference_task
 
 router = APIRouter(prefix="/api/references", tags=["References"])
 
 
-@router.post("/search", response_model=ReferenceSearchResponse)
-async def search_reference_candidates(payload: ReferenceSearchRequest, request: Request, db: AsyncSession = Depends(get_db)):
+async def _create_reference_job_response(
+    *,
+    payload: ReferenceSearchRequest,
+    request: Request,
+    db: AsyncSession,
+    request_type: str,
+) -> ReferenceJobCreateResponse:
     current_user = await get_current_user(request, db)
     try:
-        await ensure_daily_usage_available(db, current_user.id)
+        job = await create_reference_job(db, payload, user_id=current_user.id, request_type=request_type)
     except DailyUsageLimitExceeded as exc:
         raise HTTPException(
             status_code=429,
@@ -27,45 +32,42 @@ async def search_reference_candidates(payload: ReferenceSearchRequest, request: 
             },
         ) from exc
 
-    usage_log: AiUsageLog | None = None
-    try:
-        analysis = await infer_charge_candidates(payload)
-        usage_log = new_usage_log(
-            user_id=current_user.id,
-            complaint_id=None,
-            ai_job_id=None,
-            request_type="reference",
-            status="completed",
-        )
-        db.add(usage_log)
-        await db.commit()
-    except Exception as exc:
-        if usage_log:
-            usage_log.status = "failed"
-            await db.commit()
-        raise HTTPException(status_code=502, detail=f"죄명 후보 생성 중 오류가 발생했습니다: {exc}") from exc
-
-    charge_items = await search_references(
-        db,
-        payload,
-        [item["label"] for item in analysis.candidates],
-        analysis.search_keywords,
-        analysis.search_query,
-    )
-    reason_by_label = {item["label"]: item.get("reason", "") for item in analysis.candidates}
-    for item in charge_items:
-        item.reason = reason_by_label.get(item.label, "")
-
-    usage = await get_today_usage_summary(db, current_user.id)
-    return ReferenceSearchResponse(
-        is_meaningful_case=analysis.is_meaningful_case,
-        invalid_reason=analysis.invalid_reason,
-        candidates=charge_items,
-        search_keywords=analysis.search_keywords,
-        search_query=analysis.search_query,
-        fact_improvement_items=analysis.fact_improvement_items,
-        reason_improvement_items=analysis.reason_improvement_items,
+    process_reference_task.delay(job.id)
+    usage = await get_today_usage_summary(db, job.user_id)
+    return ReferenceJobCreateResponse(
+        complaint_id=job.complaint_id,
+        job_id=job.id,
+        status=job.status,
+        request_type=job.request_type,
         usage_limit=usage.limit,
         usage_used=usage.used,
         usage_remaining=usage.remaining,
+    )
+
+
+@router.post("/analyze", response_model=ReferenceJobCreateResponse)
+async def analyze_reference_candidates(payload: ReferenceSearchRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    return await _create_reference_job_response(
+        payload=payload,
+        request=request,
+        db=db,
+        request_type="reference_analysis",
+    )
+
+
+@router.get("/jobs/{job_id}", response_model=ReferenceJobStatusResponse)
+async def reference_job_status(job_id: int, request: Request, db: AsyncSession = Depends(get_db)):
+    current_user = await get_current_user(request, db)
+    job = await get_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    if job.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+
+    return ReferenceJobStatusResponse(
+        complaint_id=job.complaint_id,
+        job_id=job.id,
+        status=job.status,
+        result=json_result_from_job(job) if job.status == "completed" else None,
+        error_message=job.error_message,
     )

@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import AuthBar from '../components/AuthBar';
+import StepIndicator from '../components/StepIndicator';
+import { clearDraft } from '../draftStorage';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
-const POLL_INTERVAL_MS = 2000;
-const POLL_TIMEOUT_MS = 120000;
 
 const EMPTY_FINAL_FIELDS = {
   complainantRrn: '',
@@ -21,28 +21,6 @@ const EMPTY_FINAL_FIELDS = {
   chargeName: '',
   attachments: '',
 };
-
-function wait(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function pollJob(jobId) {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
-    await wait(POLL_INTERVAL_MS);
-
-    const response = await fetch(`${API_BASE_URL}/api/complaints/jobs/${jobId}`, {
-      credentials: 'include',
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(formatApiError(data, '작업 상태 조회에 실패했습니다.'));
-
-    if (data.status === 'completed') return data;
-    if (data.status === 'failed') throw new Error(data.error_message || 'AI 작업에 실패했습니다.');
-  }
-
-  throw new Error('생성 시간이 오래 걸리고 있습니다. 잠시 후 다시 시도해주세요.');
-}
 
 function formatApiError(data, fallback) {
   const detail = data?.detail;
@@ -69,7 +47,15 @@ function formatReferenceText(references) {
   return (references || [])
     .map((item) => String(item || '').trim())
     .filter(Boolean)
-    .map((item) => `- ${item}`)
+    .map((item) => {
+      const lines = item.split('\n').map((line) => line.trim()).filter(Boolean);
+      const precedent = lines.find((line) => line.startsWith('판례:'));
+      const issue = lines.find((line) => line.startsWith('쟁점:'));
+      if (precedent && issue) return `- ${precedent}\n  ${issue}`;
+      if (precedent) return `- ${precedent}`;
+      return '';
+    })
+    .filter(Boolean)
     .join('\n');
 }
 
@@ -80,10 +66,14 @@ function normalizeReferenceHeading(text) {
     .trim();
 }
 
+function stripReferenceSection(text) {
+  return normalizeReferenceHeading(text).split(/\n\s*※ 참고판례\s*\n/)[0].trim();
+}
+
 function appendReferenceText(reason, references) {
   const referenceText = formatReferenceText(references);
-  const base = normalizeReferenceHeading(reason);
-  if (!referenceText || base.includes('참고판례')) return base;
+  const base = stripReferenceSection(reason);
+  if (!referenceText) return base;
   return `${base}\n\n※ 참고판례\n${referenceText}`.trim();
 }
 
@@ -98,7 +88,7 @@ function parseDraftSections(text, references = [], chargeName = '') {
     purpose: defaultPurpose(chargeName),
     facts: extractSection(text, 4),
     reason: appendReferenceText(extractSection(text, 5), references),
-    evidence: extractSection(text, 6),
+    evidence: stripReferenceSection(extractSection(text, 6)),
     other: cleanOtherSection(extractSection(text, 7)),
   };
 }
@@ -140,13 +130,10 @@ export default function ResultPage() {
   const selectedReferences = location.state?.selectedReferences || [];
   const factImprovementItems = location.state?.factImprovementItems || [];
   const reasonImprovementItems = location.state?.reasonImprovementItems || [];
-  const [complaintText, setComplaintText] = useState(location.state?.complaint_text || '');
-  const [missingFields, setMissingFields] = useState(location.state?.missing_fields || []);
-  const [usedFallback, setUsedFallback] = useState(Boolean(location.state?.used_fallback));
+  const [complaintText] = useState(location.state?.complaint_text || '');
+  const [missingFields] = useState(location.state?.missing_fields || []);
   const [draftSections, setDraftSections] = useState(() => parseDraftSections(location.state?.complaint_text || '', selectedReferences, selectedChargeName));
   const [finalFields, setFinalFields] = useState({ ...EMPTY_FINAL_FIELDS, chargeName: selectedChargeName });
-  const [usage, setUsage] = useState(location.state?.usage || null);
-  const [finalizing, setFinalizing] = useState(false);
   const [downloadingPdf, setDownloadingPdf] = useState(false);
   const [error, setError] = useState('');
 
@@ -169,7 +156,7 @@ export default function ResultPage() {
     incident_location: initialFormData.incidentLocation || '',
     incident_description: draftSections.facts || initialFormData.incidentDescription || '',
     evidence_summary: draftSections.evidence || initialFormData.evidenceSummary || '',
-    requested_punishment: initialFormData.requestedPunishment || '',
+    requested_punishment: '',
     charge_name: finalFields.chargeName,
     legal_references: selectedReferences,
     complainant_rrn: finalFields.complainantRrn,
@@ -189,20 +176,18 @@ export default function ResultPage() {
   useEffect(() => {
     let ignore = false;
 
-    async function loadUsage() {
+    async function checkAuth() {
       try {
-        const response = await fetch(`${API_BASE_URL}/api/usage/today`, {
+        const response = await fetch(`${API_BASE_URL}/api/auth/me`, {
           credentials: 'include',
         });
-        const data = await response.json();
-        if (!ignore && response.ok) setUsage(data);
         if (!ignore && response.status === 401) navigate('/login');
       } catch {
-        if (!ignore) setUsage(null);
+        // Result edits can stay visible even if a transient auth check fails.
       }
     }
 
-    loadUsage();
+    checkAuth();
     return () => {
       ignore = true;
     };
@@ -244,45 +229,12 @@ export default function ResultPage() {
     }
   };
 
-  const handleFinalize = async () => {
-    setFinalizing(true);
-    setError('');
-
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/complaints/generate-async?request_type=final`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildPayload()),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(formatApiError(data, '최종본 생성에 실패했습니다.'));
-      setUsage({
-        limit: data.usage_limit,
-        used: data.usage_used,
-        remaining: data.usage_remaining,
-      });
-
-      const job = await pollJob(data.job_id);
-
-      setComplaintText(job.complaint_text);
-      setDraftSections(parseDraftSections(job.complaint_text, selectedReferences, finalFields.chargeName || selectedChargeName));
-      setMissingFields([]);
-      setUsedFallback(false);
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    } catch (err) {
-      setError(err.message || '알 수 없는 오류가 발생했습니다.');
-    } finally {
-      setFinalizing(false);
-    }
-  };
-
   if (!complaintText) {
     return (
       <div className="min-h-screen bg-slate-50 px-4 py-12 text-center text-slate-900">
         <h1 className="text-2xl font-bold tracking-normal">생성된 고소장 초안이 없습니다</h1>
         <p className="mt-3 text-sm text-slate-500">생성 결과는 장기 보관되지 않습니다. 다시 작성이 필요하면 새 고소장을 생성해주세요.</p>
-        <button onClick={() => navigate('/')} className="mt-6 rounded-lg bg-blue-700 px-5 py-3 font-bold text-white">작성 화면으로 이동</button>
+        <button onClick={() => { clearDraft(); navigate('/'); }} className="mt-6 rounded-lg bg-blue-700 px-5 py-3 font-bold text-white">작성 화면으로 이동</button>
       </div>
     );
   }
@@ -291,23 +243,13 @@ export default function ResultPage() {
     <div className="min-h-screen bg-slate-50 px-4 py-8 text-left text-slate-900">
       <main className="mx-auto max-w-6xl">
         <AuthBar />
+        <StepIndicator current={3} />
         <div className="mb-5 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div>
             <p className="text-sm font-semibold text-green-700">고소장 미리보기</p>
-            <h1 className="mt-1 text-3xl font-bold tracking-normal text-slate-950">초안 확인 후 제출용 정보만 보완하세요</h1>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <button onClick={handleDownloadPdf} disabled={downloadingPdf} className="rounded-lg bg-blue-700 px-4 py-2 text-sm font-bold text-white hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-400">
-              {downloadingPdf ? 'PDF 생성 중...' : 'PDF 다운로드'}
-            </button>
+            <h1 className="mt-1 text-3xl font-bold tracking-normal text-slate-950">초안을 확인하고 제출 정보를 채워주세요</h1>
           </div>
         </div>
-
-        {usedFallback && (
-          <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-            OPENAI_API_KEY가 없어 개발용 기본 초안으로 생성되었습니다. 환경변수 설정 후 백엔드를 재시작하면 gpt-4o-mini 결과를 사용합니다.
-          </div>
-        )}
 
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
           <section>
@@ -343,25 +285,11 @@ export default function ResultPage() {
               <DraftTextArea label="6. 증거자료" name="evidence" value={draftSections.evidence} onChange={handleDraftChange} rows={4} />
               <DraftTextArea label="7. 기타" name="other" value={draftSections.other} onChange={handleDraftChange} rows={4} helper="특별히 추가할 내용이 없으면 비워두세요." />
             </div>
-
-            <p className="mt-5 whitespace-pre-line text-center text-xs leading-5 text-slate-500">
-              {`본 문서는 AI가 작성한 초안입니다.
-본 문서의 사용으로 발생하는 어떠한 법적 책임도 서비스 제공자는 지지 않으며,
-제출 전 반드시 변호사 등 전문가의 검토를 받으세요.`}
-            </p>
-            <p className="mt-2 text-center text-xs leading-5 text-slate-500">
-              생성 결과는 개인정보 보호를 위해 자동 삭제됩니다.
-            </p>
           </section>
 
           <aside className="space-y-4">
             <div className="rounded-lg border border-blue-100 bg-blue-50 p-4">
               <h2 className="text-base font-bold text-blue-950">제출 전 보완하면 좋은 항목</h2>
-              {usage && (
-                <p className="mt-2 text-sm font-semibold text-blue-900">
-                  오늘 남은 AI 요청 {usage.remaining}회 / {usage.limit}회
-                </p>
-              )}
               {missingFields.length > 0 ? (
                 <ul className="mt-3 space-y-1 text-sm text-blue-900">
                   {missingFields.map((field) => <li key={field}>- {field}</li>)}
@@ -395,14 +323,18 @@ export default function ResultPage() {
 
               {error && <div className="mt-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
 
-              <button onClick={handleFinalize} disabled={finalizing} className="mt-4 w-full rounded-lg bg-slate-900 px-4 py-3 text-sm font-bold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400">
-                {finalizing ? 'AI가 문장을 다듬는 중...' : 'AI로 문장 다시 다듬기'}
+              <button onClick={handleDownloadPdf} disabled={downloadingPdf} className="mt-4 w-full rounded-lg bg-slate-900 px-4 py-3 text-sm font-bold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400">
+                {downloadingPdf ? 'PDF 생성 중...' : 'PDF 다운로드'}
               </button>
-              <button onClick={() => navigate('/')} className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-4 py-3 text-sm font-bold text-slate-700 hover:bg-slate-100">
+              <button onClick={() => { clearDraft(); navigate('/'); }} className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-4 py-3 text-sm font-bold text-slate-700 hover:bg-slate-100">
                 새 고소장 작성
               </button>
             </div>
           </aside>
+        </div>
+        <div className="mt-8 rounded-lg border border-slate-200 bg-white px-5 py-4 text-left text-xs leading-6 text-slate-500 shadow-sm">
+          <p>본 문서는 AI가 작성한 초안입니다. 본 문서의 사용으로 발생하는 법적 책임은 서비스 제공자가 지지 않습니다.</p>
+          <p>제출 전 반드시 변호사 등 전문가의 검토를 받으세요. 생성 결과는 개인정보 보호를 위해 자동 삭제됩니다.</p>
         </div>
       </main>
     </div>

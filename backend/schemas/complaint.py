@@ -28,13 +28,6 @@ class ComplaintGenerateRequest(BaseModel):
     attachments: list[str] = Field(default_factory=list, max_length=20)
 
 
-class ComplaintGenerateResponse(BaseModel):
-    complaint_id: str
-    complaint_text: str
-    missing_fields: list[str]
-    used_fallback: bool = False
-
-
 class ComplaintJobCreateResponse(BaseModel):
     complaint_id: int
     job_id: int
@@ -50,6 +43,24 @@ class ComplaintJobStatusResponse(BaseModel):
     job_id: int
     status: str
     complaint_text: str | None = None
+    error_message: str | None = None
+
+
+class ReferenceJobCreateResponse(BaseModel):
+    complaint_id: int
+    job_id: int
+    status: str
+    request_type: str
+    usage_limit: int
+    usage_used: int
+    usage_remaining: int
+
+
+class ReferenceJobStatusResponse(BaseModel):
+    complaint_id: int
+    job_id: int
+    status: str
+    result: dict | None = None
     error_message: str | None = None
 
 
@@ -74,27 +85,24 @@ class ReferenceSearchRequest(BaseModel):
     requested_punishment: str = Field("", max_length=1000)
 
 
-class LegalReferenceItem(BaseModel):
+class SimilarPrecedentItem(BaseModel):
     id: str
     title: str
-    summary: str
+    charge: str = ""
+    source_url: str = ""
+    issue: str = ""
+    summary: str = ""
+    question: str = ""
+    selection_reason: str = ""
+    how_to_use_in_complaint: str = ""
 
 
-class ChargeCandidateItem(BaseModel):
-    id: str
-    label: str
-    reason: str = ""
-    references: list[LegalReferenceItem] = Field(default_factory=list)
-
-
-class ReferenceSearchResponse(BaseModel):
+class ReferenceAnalyzeResponse(BaseModel):
     is_meaningful_case: bool = True
     invalid_reason: str = ""
-    candidates: list[ChargeCandidateItem]
-    search_keywords: list[str] = Field(default_factory=list)
-    search_query: str = ""
-    fact_improvement_items: list[str] = Field(default_factory=list)
-    reason_improvement_items: list[str] = Field(default_factory=list)
+    fact_summary: str = ""
+    similar_precedent: SimilarPrecedentItem | None = None
+    similar_precedents: list[SimilarPrecedentItem] = Field(default_factory=list)
     usage_limit: int
     usage_used: int
     usage_remaining: int

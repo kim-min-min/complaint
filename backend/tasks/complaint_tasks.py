@@ -47,7 +47,7 @@ async def _generate_complaint(job_id: int) -> None:
 
         try:
             payload = payload_from_job(job)
-            complaint_text, _used_fallback = await generate_complaint(payload)
+            complaint_text = await generate_complaint(payload)
 
             job.encrypted_result = encrypt_text(complaint_text)
             job.encrypted_payload = None

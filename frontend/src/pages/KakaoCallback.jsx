@@ -22,7 +22,7 @@ export default function KakaoCallback() {
           throw new Error(data.detail || '로그인 처리 중 오류가 발생했습니다.');
         }
 
-        navigate('/', { replace: true });
+        navigate('/form', { replace: true });
       } catch (error) {
         alert(error.message || '로그인 처리 중 오류가 발생했습니다.');
         navigate('/login', { replace: true });

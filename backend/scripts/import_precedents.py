@@ -1,9 +1,9 @@
 import argparse
 import asyncio
 import json
-import re
 import sys
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import delete, func, select, text
 
@@ -14,7 +14,15 @@ if str(ROOT) not in sys.path:
 
 from database import AsyncSessionLocal  # noqa: E402
 from models.precedent import Precedent, PrecedentChunk  # noqa: E402
-from services.embedding_service import create_embedding, vector_literal  # noqa: E402
+from services.embedding_service import EMBEDDING_DIMENSIONS, create_embeddings, vector_literal  # noqa: E402
+
+
+CHUNK_WEIGHTS = {
+    "issue": 0.3,
+    "fact": 0.6,
+    "outcome": 0.1,
+}
+EMBEDDING_BATCH_SIZE = 96
 
 
 def _clean(value: object, limit: int | None = None) -> str:
@@ -22,72 +30,83 @@ def _clean(value: object, limit: int | None = None) -> str:
     return text_value[:limit] if limit else text_value
 
 
-def _as_list(value: object) -> list[str]:
+def _as_list(value: object, limit: int = 80) -> list[str]:
     if isinstance(value, list):
-        return [_clean(item, 80) for item in value if _clean(item, 80)]
+        return [_clean(item, limit) for item in value if _clean(item, limit)]
     if isinstance(value, str) and value.strip():
-        return [_clean(value, 80)]
+        return [_clean(value, limit)]
     return []
 
 
-def _primary_case_name(case_name: str) -> str:
+def _as_dict(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _primary_case_name(primary_charge: str, case_name: str) -> str:
+    if primary_charge:
+        return primary_charge.removesuffix("죄")[:200]
     cleaned = _clean(case_name, 500)
-    depth = 0
-    for index, char in enumerate(cleaned):
-        if char == "(":
-            depth += 1
-        elif char == ")" and depth:
-            depth -= 1
-        elif char == "·" and depth == 0:
-            return cleaned[:index].strip().rstrip(",")[:200]
-    return cleaned.strip().rstrip(",")[:200]
+    return cleaned.split("·", 1)[0].strip().rstrip(",")[:200] if cleaned else "미분류"
 
 
-CHARGE_NAME_RULES = [
-    ("살인미수죄", [r"살인미수"]),
-    ("강도상해죄", [r"강도상해"]),
-    ("강도죄", [r"강도"]),
-    ("특수상해죄", [r"특수상해"]),
-    ("상해치사죄", [r"상해치사"]),
-    ("폭행치사죄", [r"(?<!성)폭행치사"]),
-    ("폭행치상죄", [r"(?<!성)폭행치상"]),
-    ("상해죄", [r"상해"]),
-    ("폭행죄", [r"(?<!성)폭행"]),
-    ("공무집행방해죄", [r"공무집행방해"]),
-    ("무고죄", [r"무고"]),
-    ("업무방해죄", [r"업무방해"]),
-    ("명예훼손죄", [r"명예훼손"]),
-    ("모욕죄", [r"모욕"]),
-    ("사기죄", [r"사기"]),
-    ("횡령죄", [r"횡령"]),
-    ("배임죄", [r"배임"]),
-    ("절도죄", [r"절도"]),
-    ("협박죄", [r"협박"]),
-    ("주거침입죄", [r"주거침입"]),
-    ("감금죄", [r"감금"]),
-    ("강간죄", [r"강간"]),
-    ("성폭력범죄의처벌등에관한특례법위반", [r"성폭력범죄"]),
-]
+def _court_weight_score(value: str) -> float:
+    if value == "high":
+        return 0.9
+    if value == "medium":
+        return 0.6
+    if value == "low":
+        return 0.3
+    return 0.5
 
 
-def _infer_charges_from_case_name(case_name: str) -> list[str]:
-    text_value = _clean(case_name, 500)
-    return [
-        charge
-        for charge, patterns in CHARGE_NAME_RULES
-        if any(re.search(pattern, text_value) for pattern in patterns)
-    ]
+def _chunk_items(item: dict[str, Any]) -> list[tuple[str, str, float]]:
+    embedding_texts = _as_dict(item.get("embedding_texts"))
+    chunks: list[tuple[str, str, float]] = []
+    for chunk_type in ("issue", "fact", "outcome"):
+        chunk_text = _clean(embedding_texts.get(chunk_type), 2500)
+        if chunk_text:
+            chunks.append((chunk_type, chunk_text, CHUNK_WEIGHTS[chunk_type]))
+    return chunks
 
 
-def _chunk_items(item: dict) -> list[tuple[str, str, float]]:
-    fact_context = _clean(item.get("fact_summary") or item.get("fact_context"), 2500)
-    return [("fact", fact_context, 1.0)] if fact_context else []
+async def _insert_chunk_batch(
+    rows: list[tuple[int, str, str, float]],
+    skip_embeddings: bool,
+) -> int:
+    if not rows:
+        return 0
+    if skip_embeddings:
+        embeddings = [[0.0] * EMBEDDING_DIMENSIONS for _ in rows]
+    else:
+        embeddings = await create_embeddings([row[2] for row in rows])
+
+    async with AsyncSessionLocal() as db:
+        for (precedent_id, chunk_type, chunk_text, weight), embedding in zip(rows, embeddings, strict=True):
+            await db.execute(
+                text(
+                    """
+                    INSERT INTO precedent_chunks (precedent_id, chunk_type, text, embedding, weight)
+                    VALUES (:precedent_id, :chunk_type, :chunk_text, CAST(:embedding AS vector), :weight)
+                    """
+                ),
+                {
+                    "precedent_id": precedent_id,
+                    "chunk_type": chunk_type,
+                    "chunk_text": chunk_text,
+                    "embedding": vector_literal(embedding),
+                    "weight": weight,
+                },
+            )
+        await db.commit()
+    return len(rows)
 
 
-async def import_precedents(path: Path, reset: bool) -> None:
+async def import_precedents(path: Path, reset: bool, limit: int | None, skip_embeddings: bool) -> None:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, list):
         raise ValueError("판례 JSON은 리스트 형식이어야 합니다.")
+    if limit:
+        data = data[:limit]
 
     async with AsyncSessionLocal() as db:
         if reset:
@@ -95,85 +114,91 @@ async def import_precedents(path: Path, reset: bool) -> None:
             await db.execute(delete(Precedent))
             await db.commit()
 
-        imported = 0
-        chunked = 0
-        for item in data:
-            raw_source_id = _clean(item.get("prec_id") or item.get("source_id") or item.get("case_number"), 80)
-            charge_name = _clean(item.get("charge"), 80)
-            if not raw_source_id:
-                continue
-            source_id = _clean(f"{raw_source_id}:{charge_name}" if charge_name else raw_source_id, 80)
+    imported = 0
+    chunked = 0
+    skipped = 0
+    pending_chunks: list[tuple[int, str, str, float]] = []
 
+    for item in data:
+        source_id = _clean(item.get("source_id"), 80)
+        if not source_id:
+            skipped += 1
+            continue
+
+        chunks = _chunk_items(item)
+        if not chunks:
+            skipped += 1
+            continue
+
+        raw_sections = _as_dict(item.get("raw_sections"))
+        quality = _as_dict(item.get("quality"))
+        primary_charge = _clean(item.get("primary_charge"), 120)
+        case_name = _clean(item.get("case_name"), 500) or _clean(item.get("case_number"), 120) or source_id
+
+        async with AsyncSessionLocal() as db:
             existing = await db.execute(select(Precedent).where(Precedent.source_id == source_id))
             precedent = existing.scalar_one_or_none()
             if not precedent:
                 precedent = Precedent(source_id=source_id)
                 db.add(precedent)
-            elif not reset:
-                chunk_count = await db.scalar(
-                    select(func.count(PrecedentChunk.id)).where(PrecedentChunk.precedent_id == precedent.id)
-                )
-                if chunk_count:
-                    continue
 
             precedent.source = _clean(item.get("source") or "law.go.kr", 60)
-            precedent.category = _clean(item.get("category") or item.get("primary_case_name"), 80) or "미분류"
+            precedent.source_url = _clean(item.get("source_url"), 500)
+            precedent.category = _clean(primary_charge, 80) or "미분류"
             precedent.case_number = _clean(item.get("case_number"), 120) or source_id
-            precedent.case_name = _clean(item.get("case_name"), 500) or precedent.case_number
-            precedent.primary_case_name = _clean(item.get("primary_case_name"), 200) or _primary_case_name(precedent.case_name)
+            precedent.case_name = case_name
+            precedent.primary_case_name = _primary_case_name(primary_charge, case_name)
+            precedent.primary_charge = primary_charge
             precedent.court_name = _clean(item.get("court_name"), 160)
+            precedent.court_level = _clean(item.get("court_level"), 40)
             precedent.verdict_date = _clean(item.get("verdict_date"), 40)
             precedent.verdict_type = _clean(item.get("verdict_type"), 120)
             precedent.case_type = _clean(item.get("case_type"), 80)
-            precedent.charges = _as_list(item.get("charges")) or _as_list(item.get("charge")) or _infer_charges_from_case_name(precedent.case_name)
-            precedent.keywords = _as_list(item.get("search_terms"))
-            precedent.holding = ""
-            precedent.summary = _clean(item.get("legal_point"))
-            precedent.fact_context = _clean(item.get("fact_summary") or item.get("fact_context"))
+            precedent.charges = _as_list(item.get("case_charges"), 120)
+            precedent.keywords = _as_list(item.get("search_tags"), 120)
+            precedent.holding = _clean(raw_sections.get("holding"))
+            precedent.summary = _clean(raw_sections.get("summary"))
+            precedent.reasoning_excerpt = _clean(raw_sections.get("reasoning_excerpt"))
+            precedent.fact_context = _clean(_as_dict(item.get("embedding_texts")).get("fact"))
             precedent.refs_articles = ""
             precedent.refs_cases = ""
-            precedent.quality_score = 0
-            precedent.rag_text = ""
+            precedent.extraction_quality = quality
+            precedent.quality_score = _court_weight_score(_clean(quality.get("court_weight"), 40))
+            precedent.rag_text = "\n".join(chunk_text for _, chunk_text, _ in chunks)
+
             await db.flush()
-
             await db.execute(delete(PrecedentChunk).where(PrecedentChunk.precedent_id == precedent.id))
-            for chunk_type, chunk_text, weight in _chunk_items(item):
-                embedding = await create_embedding(chunk_text)
-                await db.execute(
-                    text(
-                        """
-                        INSERT INTO precedent_chunks (precedent_id, chunk_type, text, embedding, weight)
-                        VALUES (:precedent_id, :chunk_type, :chunk_text, CAST(:embedding AS vector), :weight)
-                        """
-                    ),
-                    {
-                        "precedent_id": precedent.id,
-                        "chunk_type": chunk_type,
-                        "chunk_text": chunk_text,
-                        "embedding": vector_literal(embedding),
-                        "weight": weight,
-                    },
-                )
-                chunked += 1
+            precedent_id = precedent.id
+            await db.commit()
 
-            imported += 1
-            if imported % 10 == 0:
-                await db.commit()
-                print(f"imported={imported} chunks={chunked}")
+        pending_chunks.extend((precedent_id, chunk_type, chunk_text, weight) for chunk_type, chunk_text, weight in chunks)
+        if len(pending_chunks) >= EMBEDDING_BATCH_SIZE:
+            chunked += await _insert_chunk_batch(pending_chunks, skip_embeddings)
+            pending_chunks = []
 
-        await db.commit()
-        print(f"done imported={imported} chunks={chunked}")
+        imported += 1
+        if imported % 25 == 0:
+            print(f"imported={imported} chunks={chunked} skipped={skipped}")
+
+    chunked += await _insert_chunk_batch(pending_chunks, skip_embeddings)
+
+    async with AsyncSessionLocal() as db:
+        precedent_count = await db.scalar(select(func.count(Precedent.id)))
+        chunk_count = await db.scalar(select(func.count(PrecedentChunk.id)))
+    print(f"done imported={imported} chunks={chunked} skipped={skipped} db_precedents={precedent_count} db_chunks={chunk_count}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--path",
-        default=str(PROJECT_ROOT / "data" / "crawling" / "precedents_v2" / "_combined.json"),
+        default=str(PROJECT_ROOT / "data" / "crawling" / "structured_precedents_v2" / "precedents.json"),
     )
     parser.add_argument("--reset", action="store_true")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--skip-embeddings", action="store_true")
     args = parser.parse_args()
-    asyncio.run(import_precedents(Path(args.path), args.reset))
+    asyncio.run(import_precedents(Path(args.path), args.reset, args.limit, args.skip_embeddings))
 
 
 if __name__ == "__main__":

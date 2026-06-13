@@ -37,6 +37,10 @@ services:
     restart: unless-stopped
     env_file:
       - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://complaint:complaint@postgres:5432/complaint
+      CELERY_BROKER_URL: amqp://complaint:complaint@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: rpc://
     ports:
       - "8000:8000"
     depends_on:
@@ -79,6 +83,10 @@ services:
     restart: unless-stopped
     env_file:
       - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://complaint:complaint@postgres:5432/complaint
+      CELERY_BROKER_URL: amqp://complaint:complaint@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: rpc://
     depends_on:
       postgres:
         condition: service_healthy
@@ -93,6 +101,10 @@ services:
     restart: unless-stopped
     env_file:
       - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://complaint:complaint@postgres:5432/complaint
+      CELERY_BROKER_URL: amqp://complaint:complaint@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: rpc://
     depends_on:
       postgres:
         condition: service_healthy

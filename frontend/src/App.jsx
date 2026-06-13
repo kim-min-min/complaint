@@ -4,7 +4,7 @@ import LandingPage from './pages/LandingPage';
 import LoginPage from './pages/LoginPage';
 import KakaoCallback from './pages/KakaoCallback';
 import ComplaintForm from './pages/ComplaintForm';
-import ReferenceSelectPage from './pages/ReferenceSelectPage';
+import AnalysisPage from './pages/AnalysisPage';
 import ResultPage from './pages/ResultPage';
 import TermsPage from './pages/TermsPage';
 import PrivacyPage from './pages/PrivacyPage';
@@ -53,7 +53,7 @@ function App() {
         <Route path="/login" element={<LoginPage />} />
         <Route path="/auth/kakao/callback" element={<KakaoCallback />} />
         <Route path="/form" element={<ProtectedRoute><ComplaintForm /></ProtectedRoute>} />
-        <Route path="/references" element={<ProtectedRoute><ReferenceSelectPage /></ProtectedRoute>} />
+        <Route path="/analysis" element={<ProtectedRoute><AnalysisPage /></ProtectedRoute>} />
         <Route path="/result" element={<ProtectedRoute><ResultPage /></ProtectedRoute>} />
         <Route path="/terms" element={<TermsPage />} />
         <Route path="/privacy" element={<PrivacyPage />} />

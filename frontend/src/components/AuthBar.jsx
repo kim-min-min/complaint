@@ -1,4 +1,5 @@
 import { useNavigate } from 'react-router-dom';
+import { clearDraft } from '../draftStorage';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
 
@@ -10,6 +11,7 @@ export default function AuthBar() {
       method: 'POST',
       credentials: 'include',
     }).catch(() => {});
+    clearDraft();
     navigate('/login', { replace: true });
   };
 

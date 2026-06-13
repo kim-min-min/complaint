@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.ai_job import AiJob
 from models.complaint import Complaint
-from schemas.complaint import ComplaintGenerateRequest
+from schemas.complaint import ComplaintGenerateRequest, ReferenceSearchRequest
 from services.cleanup_service import cleanup_expired_records
 from services.complaint_service import OPENAI_MODEL
 from services.crypto_service import decrypt_text, encrypt_text
@@ -77,6 +77,48 @@ async def create_generation_job(
     return job
 
 
+async def create_reference_job(
+    db: AsyncSession,
+    payload: ReferenceSearchRequest,
+    user_id: int,
+    request_type: str,
+) -> AiJob:
+    await cleanup_expired_records(db)
+    await ensure_daily_usage_available(db, user_id)
+    expires_at = _expires_at()
+    complaint = Complaint(
+        user_id=user_id,
+        status="queued",
+        expires_at=expires_at,
+    )
+    db.add(complaint)
+    await db.flush()
+
+    job = AiJob(
+        complaint_id=complaint.id,
+        user_id=user_id,
+        request_type=request_type,
+        status="queued",
+        attempts=0,
+        encrypted_payload=encrypt_text(payload.model_dump_json()),
+        expires_at=expires_at,
+    )
+    db.add(job)
+    await db.flush()
+
+    db.add(
+        new_usage_log(
+            user_id=user_id,
+            complaint_id=complaint.id,
+            ai_job_id=job.id,
+            request_type=request_type,
+        )
+    )
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
 async def get_job(db: AsyncSession, job_id: int) -> AiJob | None:
     result = await db.execute(select(AiJob).where(AiJob.id == job_id))
     return result.scalar_one_or_none()
@@ -89,10 +131,23 @@ def payload_from_job(job: AiJob) -> ComplaintGenerateRequest:
     return ComplaintGenerateRequest(**data)
 
 
+def reference_payload_from_job(job: AiJob) -> ReferenceSearchRequest:
+    if not job.encrypted_payload:
+        raise ValueError("작업 payload가 없습니다.")
+    data = json.loads(decrypt_text(job.encrypted_payload))
+    return ReferenceSearchRequest(**data)
+
+
 def result_from_job(job: AiJob) -> str | None:
     if not job.encrypted_result:
         return None
     return decrypt_text(job.encrypted_result)
+
+
+def json_result_from_job(job: AiJob) -> dict | None:
+    if not job.encrypted_result:
+        return None
+    return json.loads(decrypt_text(job.encrypted_result))
 
 
 def current_model_name() -> str:
