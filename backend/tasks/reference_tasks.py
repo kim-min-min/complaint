@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+from time import perf_counter
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -13,6 +15,8 @@ from services.crypto_service import encrypt_text
 from services.job_service import reference_payload_from_job
 from services.reference_service import analyze_reference_points, infer_reference_query
 from services.usage_service import get_today_usage_summary
+
+logger = logging.getLogger(__name__)
 
 
 @celery_app.task(name="references.process")
@@ -29,6 +33,7 @@ async def _run_process_reference(job_id: int) -> None:
 
 
 async def _process_reference(job_id: int) -> None:
+    task_started = perf_counter()
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(AiJob).where(AiJob.id == job_id))
         job = result.scalar_one_or_none()
@@ -48,6 +53,7 @@ async def _process_reference(job_id: int) -> None:
         await db.commit()
 
         try:
+            logger.info("[reference_timing] job_id=%s status=started request_type=%s", job_id, job.request_type)
             payload = reference_payload_from_job(job)
             if job.request_type == "reference_analysis":
                 response_data = await _build_reference_response(db, job.user_id, payload)
@@ -62,6 +68,11 @@ async def _process_reference(job_id: int) -> None:
                 usage_log.status = "completed"
             if complaint:
                 complaint.status = "completed"
+            logger.info(
+                "[reference_timing] job_id=%s status=completed total_ms=%.1f",
+                job_id,
+                (perf_counter() - task_started) * 1000,
+            )
         except Exception as exc:
             job.status = "failed"
             job.error_message = str(exc)
@@ -70,13 +81,30 @@ async def _process_reference(job_id: int) -> None:
             if complaint:
                 complaint.status = "failed"
                 complaint.error_message = str(exc)
+            logger.exception(
+                "[reference_timing] job_id=%s status=failed total_ms=%.1f",
+                job_id,
+                (perf_counter() - task_started) * 1000,
+            )
         finally:
             await db.commit()
 
 
 async def _build_reference_response(db, user_id: int, payload) -> dict:
+    started = perf_counter()
     analysis = await infer_reference_query(payload)
+    logger.info(
+        "[reference_timing] step=infer_reference_query ms=%.1f charges=%s keywords=%s",
+        (perf_counter() - started) * 1000,
+        analysis.charge_candidates,
+        analysis.search_keywords,
+    )
+
+    started = perf_counter()
     usage = await get_today_usage_summary(db, user_id)
+    logger.info("[reference_timing] step=get_usage_summary ms=%.1f", (perf_counter() - started) * 1000)
+
+    started = perf_counter()
     response = await analyze_reference_points(
         db,
         payload,
@@ -84,6 +112,11 @@ async def _build_reference_response(db, user_id: int, payload) -> dict:
         usage.limit,
         usage.used,
         usage.remaining,
+    )
+    logger.info(
+        "[reference_timing] step=analyze_reference_points ms=%.1f precedent_count=%s",
+        (perf_counter() - started) * 1000,
+        len(response.similar_precedents or []),
     )
     return response.model_dump()
 

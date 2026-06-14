@@ -92,9 +92,16 @@ class SimilarPrecedentItem(BaseModel):
     source_url: str = ""
     issue: str = ""
     summary: str = ""
+    fact: str = ""
+    outcome: str = ""
     question: str = ""
     selection_reason: str = ""
     how_to_use_in_complaint: str = ""
+
+
+class ReferenceGuidanceRequest(ReferenceSearchRequest):
+    fact_summary: str = ""
+    precedent: SimilarPrecedentItem
 
 
 class ReferenceAnalyzeResponse(BaseModel):

@@ -8,6 +8,7 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
 const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 120000;
 const analysisCache = new Map();
+const guidanceCache = new Map();
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -21,6 +22,16 @@ function formatApiError(data, fallback = '요청 처리에 실패했습니다.')
   return fallback;
 }
 
+async function readApiResponse(response) {
+  const text = await response.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { detail: text };
+  }
+}
+
 async function pollJob(jobId, onStatus) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
@@ -28,7 +39,7 @@ async function pollJob(jobId, onStatus) {
     const response = await fetch(`${API_BASE_URL}/api/complaints/jobs/${jobId}`, {
       credentials: 'include',
     });
-    const data = await response.json();
+    const data = await readApiResponse(response);
     if (!response.ok) throw new Error(formatApiError(data, '작업 상태 조회에 실패했습니다.'));
     if (data.status === 'completed') return data;
     if (data.status === 'failed') throw new Error(data.error_message || 'AI 작업에 실패했습니다.');
@@ -44,7 +55,7 @@ async function pollReferenceJob(jobId, onStatus) {
     const response = await fetch(`${API_BASE_URL}/api/references/jobs/${jobId}`, {
       credentials: 'include',
     });
-    const data = await response.json();
+    const data = await readApiResponse(response);
     if (!response.ok) throw new Error(formatApiError(data, '작업 상태 조회에 실패했습니다.'));
     if (data.status === 'completed') return data.result;
     if (data.status === 'failed') throw new Error(data.error_message || '사건 분석에 실패했습니다.');
@@ -108,8 +119,11 @@ export default function AnalysisPage() {
   const [draftSnapshot] = useState(() => readDraft());
   const formData = location.state?.formData || draftSnapshot.formData;
   const [corePrecedents, setCorePrecedents] = useState([]);
+  const [factSummary, setFactSummary] = useState('');
   const [selectedPrecedentIds, setSelectedPrecedentIds] = useState(draftSnapshot.selectedPrecedentIds || []);
   const [coreAnswers, setCoreAnswers] = useState(draftSnapshot.issueAnswers || {});
+  const [pageMode, setPageMode] = useState('select');
+  const [guidanceLoadingIds, setGuidanceLoadingIds] = useState([]);
   const [usage, setUsage] = useState(location.state?.usage || null);
   const [isMeaningfulCase, setIsMeaningfulCase] = useState(true);
   const [invalidReason, setInvalidReason] = useState('');
@@ -138,7 +152,7 @@ export default function AnalysisPage() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(requestBody),
           }).then(async (response) => {
-            const data = await response.json();
+            const data = await readApiResponse(response);
             if (response.status === 401) return { unauthorized: true };
             if (!response.ok) throw new Error(formatApiError(data, '사건 분석에 실패했습니다.'));
             return pollReferenceJob(data.job_id, setStatusMessage);
@@ -155,6 +169,7 @@ export default function AnalysisPage() {
 
         setIsMeaningfulCase(data.is_meaningful_case !== false);
         setInvalidReason(data.invalid_reason || '');
+        setFactSummary(data.fact_summary || '');
         const precedents = data.similar_precedents?.length ? data.similar_precedents : (data.similar_precedent ? [data.similar_precedent] : []);
         setCorePrecedents(precedents);
         setSelectedPrecedentIds((prev) => {
@@ -163,7 +178,7 @@ export default function AnalysisPage() {
           if (prevValid.length) return prevValid;
           const savedValid = (draftSnapshot.selectedPrecedentIds || []).filter((id) => validIds.includes(id));
           if (savedValid.length) return savedValid;
-          return validIds;
+          return [];
         });
         setCoreAnswers((prev) => prev || draftSnapshot.issueAnswers || {});
         setUsage({
@@ -200,7 +215,72 @@ export default function AnalysisPage() {
 
   const selectedReferences = selectedReferenceTexts(corePrecedents, selectedPrecedentIds, coreAnswers);
   const selectedChargeName = selectedChargeText(corePrecedents, selectedPrecedentIds);
-  const canGenerate = isMeaningfulCase && !loading && !submitting && (!corePrecedents.length || selectedPrecedentIds.length > 0);
+  const selectedPrecedents = corePrecedents.filter((item) => selectedPrecedentIds.includes(referenceKey(item)));
+  const selectedGuidanceReady = selectedPrecedentIds.every((id) => {
+    const precedent = corePrecedents.find((item) => referenceKey(item) === id);
+    return precedent?.question && !guidanceLoadingIds.includes(id);
+  });
+  const canProceedToGuidance = isMeaningfulCase && !loading && !submitting && selectedPrecedentIds.length > 0;
+  const canGenerate = isMeaningfulCase && !loading && !submitting && (
+    !corePrecedents.length || (pageMode === 'guidance' && selectedPrecedentIds.length > 0 && selectedGuidanceReady)
+  );
+
+  const buildGuidance = async (precedent) => {
+    const id = referenceKey(precedent);
+    if (!id || precedent.question || guidanceLoadingIds.includes(id)) return;
+    const requestBody = toRequestBody(formData);
+    const cacheKey = JSON.stringify({ requestBody, precedent });
+    setGuidanceLoadingIds((prev) => [...new Set([...prev, id])]);
+    setError('');
+    try {
+      if (!guidanceCache.has(cacheKey)) {
+        guidanceCache.set(cacheKey, fetch(`${API_BASE_URL}/api/references/guidance`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...requestBody,
+            fact_summary: factSummary,
+            precedent,
+          }),
+        }).then(async (response) => {
+          const data = await readApiResponse(response);
+          if (response.status === 401) return { unauthorized: true };
+          if (!response.ok) throw new Error(formatApiError(data, '판례 쟁점 질문 생성에 실패했습니다.'));
+          return data;
+        }));
+      }
+      const guidedPrecedent = await guidanceCache.get(cacheKey);
+      if (guidedPrecedent?.unauthorized) {
+        navigate('/login');
+        return;
+      }
+      setCorePrecedents((prev) => prev.map((item) => (referenceKey(item) === id ? { ...item, ...guidedPrecedent } : item)));
+    } catch (err) {
+      setSelectedPrecedentIds((prev) => prev.filter((item) => item !== id));
+      setError(err.message || '판례 쟁점 질문 생성 중 오류가 발생했습니다.');
+    } finally {
+      setGuidanceLoadingIds((prev) => prev.filter((item) => item !== id));
+    }
+  };
+
+  const handlePrecedentSelection = (precedent, checked) => {
+    const id = referenceKey(precedent);
+    if (!id) return;
+    if (!checked) {
+      setSelectedPrecedentIds((prev) => prev.filter((item) => item !== id));
+      return;
+    }
+    setSelectedPrecedentIds((prev) => [...new Set([...prev, id])]);
+  };
+
+  const handleProceedToGuidance = async () => {
+    if (!canProceedToGuidance) return;
+    setPageMode('guidance');
+    setStatusMessage('선택한 판례의 쟁점을 현재 사건에 맞춰 질문으로 바꾸고 있습니다.');
+    await Promise.all(selectedPrecedents.map((precedent) => buildGuidance(precedent)));
+    setStatusMessage('');
+  };
 
   const handleGenerate = async () => {
     if (!canGenerate) return;
@@ -221,7 +301,7 @@ export default function AnalysisPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = await response.json();
+      const data = await readApiResponse(response);
       if (response.status === 401) {
         navigate('/login');
         return;
@@ -259,8 +339,14 @@ export default function AnalysisPage() {
         <StepIndicator current={2} />
         <header className="mb-7">
           <p className="text-sm font-semibold text-[#50534e]">유사 판례</p>
-          <h1 className="mt-2 text-3xl font-semibold tracking-normal text-[#111111]">고소장에 반영할 판례를 선택해주세요</h1>
-          <p className="mt-3 text-sm leading-6 text-[#5f625d]">입력한 사건과 가까운 판례를 찾았습니다. 참고할 판례를 선택하고, 필요한 내용만 보완해주세요.</p>
+          <h1 className="mt-2 text-3xl font-semibold tracking-normal text-[#111111]">
+            {pageMode === 'select' ? '고소장에 반영할 판례를 선택해주세요' : '판례 쟁점에 대해 보완해주세요'}
+          </h1>
+          <p className="mt-3 text-sm leading-6 text-[#5f625d]">
+            {pageMode === 'select'
+              ? '입력한 사건과 가까운 판례를 찾았습니다. 참고할 판례를 선택해주세요.'
+              : '선택한 판례의 쟁점을 현재 사건에 맞춰 질문으로 정리했습니다.'}
+          </p>
           {usage && (
             <p className="mt-3 inline-flex rounded-full border border-[#d7d9d2] bg-[#eef2e8] px-4 py-2 text-sm font-semibold text-[#3d4a35]">
               오늘 남은 AI 요청 {usage.remaining}회 / {usage.limit}회
@@ -285,52 +371,31 @@ export default function AnalysisPage() {
           <>
             {corePrecedents.length ? (
               <section className="space-y-4">
-                {corePrecedents.map((precedent) => {
+                {(pageMode === 'select' ? corePrecedents : selectedPrecedents).map((precedent) => {
                   const id = referenceKey(precedent);
                   const selected = selectedPrecedentIds.includes(id);
                   return (
                     <article key={id} className={`rounded-[6px] border bg-[#fbfbf8] p-5 shadow-[0_18px_44px_rgba(30,32,27,0.06)] ${selected ? 'border-[#111111]' : 'border-[#d7d9d2]'}`}>
-                      <label className="flex items-start gap-3">
+                      <div className="flex flex-wrap items-start justify-between gap-4">
+                        <label className="flex items-start gap-3">
                         <input
                           type="checkbox"
                           checked={selected}
-                          onChange={(event) => {
-                            setSelectedPrecedentIds((prev) => {
-                              if (event.target.checked) return [...new Set([...prev, id])];
-                              return prev.filter((item) => item !== id);
-                            });
-                          }}
+                          disabled={pageMode === 'guidance'}
+                          onChange={(event) => handlePrecedentSelection(precedent, event.target.checked)}
                           className="mt-1 h-4 w-4 accent-[#111111]"
                         />
                         <span>
-                          <span className="block text-xl font-semibold text-[#111111]">유사 판례</span>
-                          <span className="mt-2 block text-sm leading-6 text-[#5f625d]">선택한 판례는 고소이유에 참고자료로 반영됩니다.</span>
+                          <span className="block text-xs font-semibold text-[#6b6e66]">선택</span>
+                          <span className="mt-2 block text-base font-semibold leading-6 text-[#111111]">{precedent.title}</span>
                         </span>
-                      </label>
-
-                      {precedent.question && (
-                        <>
-                          <p className="mt-4 text-base font-semibold leading-7 text-[#111111]">{precedent.question}</p>
-                          <textarea
-                            value={coreAnswers[id] || ''}
-                            onChange={(event) => setCoreAnswers((prev) => ({ ...prev, [id]: event.target.value }))}
-                            rows={5}
-                            placeholder="답변을 입력하세요"
-                            className="mt-4 w-full resize-y rounded-[4px] border border-[#d7d9d2] bg-white px-3 py-2 text-sm leading-6 text-[#111111] outline-none transition placeholder:text-[#8b8e86] focus:border-[#111111] focus:ring-2 focus:ring-[#e9efe3]"
-                          />
-                        </>
-                      )}
-
-                      <div className="mt-5 rounded-[4px] border border-[#e1e2dd] bg-white p-4">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <p className="text-sm font-semibold text-[#6b6e66]">참고 판례</p>
-                          {precedent.source_url && (
-                            <a href={precedent.source_url} target="_blank" rel="noreferrer" className="text-sm font-semibold text-[#3d4a35] underline underline-offset-4">
-                              원문 보기
-                            </a>
-                          )}
-                        </div>
-                        <p className="mt-2 text-base font-semibold leading-6 text-[#111111]">{precedent.title}</p>
+                        </label>
+                        {precedent.source_url && (
+                          <a href={precedent.source_url} target="_blank" rel="noreferrer" className="text-sm font-semibold text-[#3d4a35] underline underline-offset-4">
+                            원문 보기
+                          </a>
+                        )}
+                      </div>
 
                         {precedent.issue && (
                           <div className="mt-4">
@@ -345,7 +410,25 @@ export default function AnalysisPage() {
                             <p className="mt-2 whitespace-pre-wrap break-keep text-sm leading-6 text-[#5f625d]">{precedent.summary}</p>
                           </div>
                         )}
-                      </div>
+
+                      {pageMode === 'guidance' && guidanceLoadingIds.includes(id) && (
+                        <div className="mt-5 rounded-[4px] border border-[#cbd8bd] bg-[#eef2e8] px-4 py-3 text-sm font-semibold text-[#3d4a35]">
+                          선택한 판례의 쟁점을 현재 사건에 맞춰 질문으로 바꾸고 있습니다.
+                        </div>
+                      )}
+
+                      {pageMode === 'guidance' && precedent.question && (
+                        <>
+                          <p className="mt-5 text-base font-semibold leading-7 text-[#111111]">{precedent.question}</p>
+                          <textarea
+                            value={coreAnswers[id] || ''}
+                            onChange={(event) => setCoreAnswers((prev) => ({ ...prev, [id]: event.target.value }))}
+                            rows={5}
+                            placeholder="답변을 입력하세요"
+                            className="mt-4 w-full resize-y rounded-[4px] border border-[#d7d9d2] bg-white px-3 py-2 text-sm leading-6 text-[#111111] outline-none transition placeholder:text-[#8b8e86] focus:border-[#111111] focus:ring-2 focus:ring-[#e9efe3]"
+                          />
+                        </>
+                      )}
                     </article>
                   );
                 })}
@@ -359,9 +442,15 @@ export default function AnalysisPage() {
             <div className="mt-5 space-y-3">
               {error && <div className="rounded-[4px] border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
               {statusMessage && !error && <div className="rounded-[4px] border border-[#cbd8bd] bg-[#eef2e8] px-4 py-3 text-sm text-[#3d4a35]">{statusMessage}</div>}
-              <button onClick={handleGenerate} disabled={!canGenerate} className="w-full rounded-full bg-[#111111] px-4 py-3 text-base font-semibold text-white transition hover:bg-[#30302d] disabled:cursor-not-allowed disabled:bg-[#9a9d96]">
-                {submitting ? 'AI가 초안 작성 중...' : '고소장 초안 작성'}
-              </button>
+              {corePrecedents.length && pageMode === 'select' ? (
+                <button onClick={handleProceedToGuidance} disabled={!canProceedToGuidance || guidanceLoadingIds.length > 0} className="w-full rounded-full bg-[#111111] px-4 py-3 text-base font-semibold text-white transition hover:bg-[#30302d] disabled:cursor-not-allowed disabled:bg-[#9a9d96]">
+                  선택한 판례로 보완 질문 만들기
+                </button>
+              ) : (
+                <button onClick={handleGenerate} disabled={!canGenerate} className="w-full rounded-full bg-[#111111] px-4 py-3 text-base font-semibold text-white transition hover:bg-[#30302d] disabled:cursor-not-allowed disabled:bg-[#9a9d96]">
+                  {submitting ? 'AI가 초안 작성 중...' : '고소장 초안 작성'}
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => navigate('/form', { state: { formData } })}

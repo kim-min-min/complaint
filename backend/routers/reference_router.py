@@ -2,9 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
-from schemas.complaint import ReferenceJobCreateResponse, ReferenceJobStatusResponse, ReferenceSearchRequest
+from schemas.complaint import ReferenceGuidanceRequest, ReferenceJobCreateResponse, ReferenceJobStatusResponse, ReferenceSearchRequest, SimilarPrecedentItem
 from services.auth_service import get_current_user
 from services.job_service import create_reference_job, get_job, json_result_from_job
+from services.reference_service import build_precedent_guidance
 from services.usage_service import DailyUsageLimitExceeded, get_today_usage_summary
 from tasks.reference_tasks import process_reference_task
 
@@ -53,6 +54,12 @@ async def analyze_reference_candidates(payload: ReferenceSearchRequest, request:
         db=db,
         request_type="reference_analysis",
     )
+
+
+@router.post("/guidance", response_model=SimilarPrecedentItem)
+async def build_reference_guidance(payload: ReferenceGuidanceRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    await get_current_user(request, db)
+    return await build_precedent_guidance(payload)
 
 
 @router.get("/jobs/{job_id}", response_model=ReferenceJobStatusResponse)
