@@ -8,30 +8,14 @@ from models.ai_job import AiJob
 from models.complaint import Complaint
 from schemas.complaint import ComplaintGenerateRequest, ReferenceSearchRequest
 from services.cleanup_service import cleanup_expired_records
-from services.complaint_service import OPENAI_MODEL
 from services.crypto_service import decrypt_text, encrypt_text
 from services.usage_service import ensure_daily_usage_available, new_usage_log
 
-DEFAULT_USER_ID = 1
 JOB_TTL_HOURS = 24
 
 
 def _expires_at() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=JOB_TTL_HOURS)
-
-
-async def ensure_dev_user(db: AsyncSession) -> int:
-    from models.user import User
-
-    result = await db.execute(select(User).where(User.id == DEFAULT_USER_ID))
-    user = result.scalar_one_or_none()
-    if user:
-        return user.id
-
-    user = User(id=DEFAULT_USER_ID, kakao_id=0, nickname="dev-user", email=None)
-    db.add(user)
-    await db.flush()
-    return user.id
 
 
 async def create_generation_job(
@@ -149,6 +133,3 @@ def json_result_from_job(job: AiJob) -> dict | None:
         return None
     return json.loads(decrypt_text(job.encrypted_result))
 
-
-def current_model_name() -> str:
-    return OPENAI_MODEL

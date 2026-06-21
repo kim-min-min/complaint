@@ -1,8 +1,6 @@
 import json
-import logging
 import re
 from dataclasses import dataclass, field
-from time import perf_counter
 from typing import Any
 
 import httpx
@@ -19,7 +17,6 @@ from services.charge_search_config import CANONICAL_CHARGES
 from services.complaint_service import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
 from services.embedding_service import create_embedding, vector_literal
 
-logger = logging.getLogger(__name__)
 
 SEARCH_CANDIDATE_LIMIT = 10
 RERANK_INPUT_LIMIT = 10
@@ -35,67 +32,16 @@ class ReferenceAnalysis:
     search_query: str = ""
 
 
-def _dedupe_keywords(keywords: list[str]) -> list[str]:
-    seen = set()
-    results = []
-    for keyword in keywords:
-        cleaned = str(keyword or "").strip()
-        if not cleaned or cleaned in seen:
-            continue
-        seen.add(cleaned)
-        results.append(cleaned)
-    return results[:20]
-
-
-def _normalize_charge_candidates(values: list[Any]) -> list[str]:
-    canonical_set = set(CANONICAL_CHARGES)
-    seen = set()
-    results = []
-    for value in values:
-        cleaned = _normalize_search_text(str(value or "")).replace(" ", "")
-        if cleaned not in canonical_set or cleaned in seen:
-            continue
-        seen.add(cleaned)
-        results.append(cleaned)
-        if len(results) >= 3:
-            break
-    return results
-
-
-def _parse_reference_analysis(data: dict[str, Any], fallback_query: str) -> ReferenceAnalysis:
-    choices = data.get("choices") or []
-    if not choices:
-        raise ValueError("OpenAI 응답에 검색 정보가 없습니다.")
-    text_value = ((choices[0].get("message") or {}).get("content") or "").strip()
-    parsed = json.loads(text_value)
-    if not isinstance(parsed, dict):
-        raise ValueError("검색 정보 응답 형식이 올바르지 않습니다.")
-
-    raw_keywords = parsed.get("search_keywords") or []
-    raw_candidates = parsed.get("charge_candidates") or []
-    search_query = _normalize_search_text(str(parsed.get("search_query") or fallback_query))
-    return ReferenceAnalysis(
-        charge_candidates=_normalize_charge_candidates(raw_candidates if isinstance(raw_candidates, list) else []),
-        is_meaningful_case=bool(parsed.get("is_meaningful_case", True)),
-        invalid_reason=_normalize_search_text(str(parsed.get("invalid_reason") or "")),
-        search_keywords=_dedupe_keywords(raw_keywords if isinstance(raw_keywords, list) else []),
-        search_query=search_query,
-    )
-
-
 async def infer_reference_query(payload: ReferenceSearchRequest) -> ReferenceAnalysis:
-    started = perf_counter()
     fallback_query = _reference_query_text(payload, [], "")
     is_meaningful_case = len(_normalize_search_text(payload.incident_description)) >= 10
     if not is_meaningful_case:
-        logger.info("[reference_timing] step=infer_reference_query skipped=short_input ms=%.1f", (perf_counter() - started) * 1000)
         return ReferenceAnalysis(
             is_meaningful_case=False,
             invalid_reason="사건 내용이 너무 짧아 유사 판례를 찾기 어렵습니다.",
             search_query=fallback_query,
         )
     if not OPENAI_API_KEY:
-        logger.info("[reference_timing] step=infer_reference_query skipped=no_api_key ms=%.1f", (perf_counter() - started) * 1000)
         return ReferenceAnalysis(search_query=fallback_query)
 
     prompt = f"""
@@ -142,7 +88,6 @@ async def infer_reference_query(payload: ReferenceSearchRequest) -> ReferenceAna
     }
 
     url = f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions"
-    api_started = perf_counter()
     async with httpx.AsyncClient(timeout=45) as client:
         response = await client.post(
             url,
@@ -151,84 +96,91 @@ async def infer_reference_query(payload: ReferenceSearchRequest) -> ReferenceAna
         )
         response.raise_for_status()
         data = response.json()
-    logger.info(
-        "[reference_timing] step=infer_reference_query_api ms=%.1f model=%s",
-        (perf_counter() - api_started) * 1000,
-        OPENAI_MODEL,
-    )
 
     parsed = _parse_reference_analysis(data, fallback_query)
-    logger.info(
-        "[reference_timing] step=infer_reference_query_total ms=%.1f charges=%s keywords=%s search_query=%s",
-        (perf_counter() - started) * 1000,
-        parsed.charge_candidates,
-        parsed.search_keywords,
-        parsed.search_query,
-    )
     return parsed
 
 
-def _reference_query_text(payload: ReferenceSearchRequest, search_keywords: list[str], search_query: str) -> str:
-    return " ".join(
-        [
-            search_query,
-            payload.incident_location,
-            payload.incident_description,
-            " ".join(search_keywords),
-        ]
-    ).strip()
+async def analyze_reference_points(
+    db: AsyncSession,
+    payload: ReferenceSearchRequest,
+    analysis: ReferenceAnalysis,
+    usage_limit: int,
+    usage_used: int,
+    usage_remaining: int,
+) -> ReferenceAnalyzeResponse:
+    fact_summary = analysis.search_query or _reference_query_text(payload, analysis.search_keywords, "")
+    if not analysis.is_meaningful_case or not fact_summary:
+        return ReferenceAnalyzeResponse(
+            is_meaningful_case=analysis.is_meaningful_case,
+            invalid_reason=analysis.invalid_reason,
+            fact_summary=fact_summary,
+            similar_precedent=None,
+            similar_precedents=[],
+            usage_limit=usage_limit,
+            usage_used=usage_used,
+            usage_remaining=usage_remaining,
+        )
+
+    terms = _dedupe_keywords(analysis.search_keywords)
+    similar_precedents = await _search_reference_precedents(
+        db,
+        payload,
+        fact_summary,
+        terms,
+        analysis.charge_candidates,
+    )
+    similar_precedent = similar_precedents[0] if similar_precedents else None
+
+    return ReferenceAnalyzeResponse(
+        is_meaningful_case=analysis.is_meaningful_case,
+        invalid_reason=analysis.invalid_reason,
+        fact_summary=fact_summary,
+        similar_precedent=similar_precedent,
+        similar_precedents=similar_precedents,
+        usage_limit=usage_limit,
+        usage_used=usage_used,
+        usage_remaining=usage_remaining,
+    )
 
 
-def _normalize_search_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value or "").strip()
+async def build_precedent_guidance(request: ReferenceGuidanceRequest) -> SimilarPrecedentItem:
+    fact_summary = request.fact_summary or _reference_query_text(request, [], "")
+    precedent_data = _precedent_item_to_guidance_input(request.precedent)
+    guidance_by_id = await _build_precedent_guidance_batch(request, fact_summary, [precedent_data])
+    selected_precedent = guidance_by_id.get(request.precedent.id) or _fallback_selected_precedent(precedent_data)
+    return _to_similar_precedent_item(precedent_data, selected_precedent)
 
 
-def _best_excerpt(row, terms: list[str], max_length: int = 260) -> str:
-    candidates = [
-        _normalize_search_text(str(row.chunk_text or "")),
-        _normalize_search_text(str(row.fact_context or "")),
-        _normalize_search_text(str(row.holding or "")),
-    ]
-    text_value = next((candidate for candidate in candidates if candidate), "")
-    if len(text_value) <= max_length:
-        return text_value
+async def _search_reference_precedents(
+    db: AsyncSession,
+    payload: ReferenceSearchRequest,
+    fact_summary: str,
+    terms: list[str],
+    charge_candidates: list[str],
+) -> list[SimilarPrecedentItem]:
+    def unique_precedents(precedents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        results = []
+        seen_ids = set()
+        for precedent in precedents:
+            precedent_id = precedent.get("id")
+            if precedent_id in seen_ids:
+                continue
+            seen_ids.add(precedent_id)
+            results.append(precedent)
+            if len(results) >= SEARCH_CANDIDATE_LIMIT:
+                break
+        return results
 
-    hit_positions = [text_value.find(term) for term in terms if term and text_value.find(term) >= 0]
-    if hit_positions:
-        center = min(hit_positions)
-        start = max(0, center - 70)
-        end = min(len(text_value), start + max_length)
-        start = max(0, end - max_length)
-        prefix = "..." if start > 0 else ""
-        suffix = "..." if end < len(text_value) else ""
-        return f"{prefix}{text_value[start:end].rstrip()}{suffix}"
-    return text_value[:max_length].rstrip() + "..."
-
-
-def _precedent_title(row) -> str:
-    label = _normalize_search_text(str(getattr(row, "primary_charge", "") or row.primary_case_name or "판례"))
-    court = _normalize_search_text(str(getattr(row, "court_name", "") or ""))
-    date = _normalize_search_text(str(getattr(row, "verdict_date", "") or ""))
-    number = _normalize_search_text(str(getattr(row, "case_number", "") or ""))
-    pieces = [piece for piece in [label, court, date] if piece]
-    title = " · ".join(pieces) or "판례"
-    if number:
-        title = f"{title} ({number})"
-    return title
-
-
-def _charge_filter_sql(charge_labels: list[str]) -> tuple[str, dict[str, str]]:
-    labels = [label for label in charge_labels[:4] if label]
-    if not labels:
-        return "", {}
-
-    clauses = []
-    params = {}
-    for index, label in enumerate(labels):
-        label_key = f"label_{index}"
-        params[label_key] = label
-        clauses.append(f"jsonb_exists(p.charges, :{label_key})")
-    return "AND (" + " OR ".join(clauses) + ")", params
+    searched_precedents = await _search_similar_precedents(
+        db,
+        fact_summary,
+        terms,
+        charge_candidates,
+    )
+    unique_results = unique_precedents(searched_precedents)
+    reranked_results = await _rerank_precedents(payload, fact_summary, unique_results)
+    return [_to_precedent_search_item(precedent) for precedent in reranked_results]
 
 
 async def _search_similar_precedents(
@@ -237,17 +189,8 @@ async def _search_similar_precedents(
     terms: list[str],
     charge_labels: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    total_started = perf_counter()
-    embedding_started = perf_counter()
     query_embedding = await create_embedding(query_text)
-    logger.info(
-        "[reference_timing] step=search_embedding ms=%.1f query_chars=%s limit=%s",
-        (perf_counter() - embedding_started) * 1000,
-        len(query_text or ""),
-        SEARCH_CANDIDATE_LIMIT,
-    )
     charge_filter, charge_params = _charge_filter_sql(charge_labels or [])
-    db_started = perf_counter()
     await db.execute(text("SET LOCAL enable_indexscan = off"))
     await db.execute(text("SET LOCAL enable_bitmapscan = off"))
     result = await db.execute(
@@ -292,13 +235,6 @@ async def _search_similar_precedents(
         },
     )
     rows = result.fetchall()
-    logger.info(
-        "[reference_timing] step=search_db ms=%.1f row_count=%s charge_filter=%s",
-        (perf_counter() - db_started) * 1000,
-        len(rows),
-        bool(charge_filter),
-    )
-    map_started = perf_counter()
     precedents = [
         {
             "id": str(row.source_id),
@@ -314,243 +250,7 @@ async def _search_similar_precedents(
         }
         for row in rows
     ]
-    logger.info(
-        "[reference_timing] step=search_total ms=%.1f map_ms=%.1f result_count=%s",
-        (perf_counter() - total_started) * 1000,
-        (perf_counter() - map_started) * 1000,
-        len(precedents),
-    )
-    for index, precedent in enumerate(precedents[:10], start=1):
-        logger.info(
-            "[reference_timing] step=search_result rank=%s distance=%.6f title=%s issue=%s",
-            index,
-            precedent["distance"],
-            precedent["title"],
-            precedent["issue"][:120],
-        )
     return precedents
-
-
-def _parse_precedent_guidance_items(data: dict[str, Any]) -> dict[str, dict[str, str]]:
-    choices = data.get("choices") or []
-    if not choices:
-        return {}
-    text_value = ((choices[0].get("message") or {}).get("content") or "").strip()
-    parsed = json.loads(text_value)
-    items = parsed.get("items") if isinstance(parsed, dict) else None
-    if not isinstance(items, list):
-        return {}
-
-    results = {}
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        precedent_id = str(item.get("precedent_id") or "").strip()
-        precedent_issue = _normalize_search_text(str(item.get("precedent_issue") or ""))
-        issue_question = _normalize_search_text(str(item.get("issue_question") or item.get("question") or ""))
-        if not precedent_id or not precedent_issue or not issue_question:
-            continue
-        results[precedent_id] = {
-            "precedent_id": precedent_id,
-            "precedent_issue": precedent_issue,
-            "issue_question": issue_question,
-            "selection_reason": _normalize_search_text(str(item.get("relevance_reason") or item.get("selection_reason") or "")),
-            "how_to_use_in_complaint": _normalize_search_text(str(item.get("how_to_use_in_complaint") or "")),
-        }
-    return results
-
-
-def _parse_reranked_ids(data: dict[str, Any], candidate_ids: list[str]) -> list[str]:
-    choices = data.get("choices") or []
-    if not choices:
-        return []
-    text_value = ((choices[0].get("message") or {}).get("content") or "").strip()
-    parsed = json.loads(text_value)
-    ranked_ids = parsed.get("ranked_ids") if isinstance(parsed, dict) else None
-    if not isinstance(ranked_ids, list):
-        return []
-
-    allowed = set(candidate_ids)
-    results = []
-    for value in ranked_ids:
-        precedent_id = str(value or "").strip()
-        if precedent_id in allowed and precedent_id not in results:
-            results.append(precedent_id)
-    return results
-
-
-def _fallback_selected_precedent(precedent: dict[str, Any]) -> dict[str, str]:
-    issue = _normalize_search_text(precedent["issue"] or "이 판례에서 다룬 핵심 쟁점")
-    return {
-        "precedent_id": precedent["id"],
-        "precedent_issue": issue,
-        "issue_question": f"'{issue}'와 관련해 현재 사건에서 추가로 설명할 사실이 있나요?",
-        "selection_reason": "fact 유사도 기준으로 가장 가까운 판례입니다.",
-        "how_to_use_in_complaint": "고소이유에서는 사용자 사건의 구체적 사실관계와 참고판례의 핵심 쟁점이 연결되는 부분을 조심스럽게 설명합니다.",
-    }
-
-
-def _to_similar_precedent_item(
-    precedent: dict[str, Any],
-    selected_precedent: dict[str, str],
-) -> SimilarPrecedentItem:
-    return SimilarPrecedentItem(
-        id=precedent["id"],
-        title=precedent["title"],
-        charge=precedent.get("matched_charge") or precedent["primary_charge"],
-        source_url=precedent["source_url"],
-        issue=selected_precedent["precedent_issue"],
-        summary=precedent["summary"],
-        fact=precedent.get("fact", ""),
-        outcome=precedent.get("outcome", ""),
-        question=selected_precedent["issue_question"],
-        selection_reason=selected_precedent["selection_reason"],
-        how_to_use_in_complaint=selected_precedent["how_to_use_in_complaint"],
-    )
-
-
-def _to_precedent_search_item(precedent: dict[str, Any]) -> SimilarPrecedentItem:
-    return SimilarPrecedentItem(
-        id=precedent["id"],
-        title=precedent["title"],
-        charge=precedent.get("matched_charge") or precedent.get("primary_charge", ""),
-        source_url=precedent.get("source_url", ""),
-        issue=precedent.get("issue", ""),
-        summary=precedent.get("summary", ""),
-        fact=precedent.get("fact", ""),
-        outcome=precedent.get("outcome", ""),
-    )
-
-
-def _precedent_item_to_guidance_input(precedent: SimilarPrecedentItem) -> dict[str, Any]:
-    return {
-        "id": precedent.id,
-        "title": precedent.title,
-        "primary_charge": precedent.charge,
-        "case_charges": [precedent.charge] if precedent.charge else [],
-        "source_url": precedent.source_url,
-        "issue": precedent.issue,
-        "fact": precedent.fact or precedent.summary,
-        "outcome": precedent.outcome,
-        "summary": precedent.summary,
-    }
-
-
-async def _build_precedent_guidance_batch(
-    payload: ReferenceSearchRequest,
-    fact_summary: str,
-    precedents: list[dict[str, Any]],
-) -> dict[str, dict[str, str]]:
-    started = perf_counter()
-    if not OPENAI_API_KEY or not precedents:
-        logger.info(
-            "[reference_timing] step=build_guidance skipped=%s ms=%.1f precedent_count=%s",
-            "no_api_key" if not OPENAI_API_KEY else "no_precedents",
-            (perf_counter() - started) * 1000,
-            len(precedents),
-        )
-        return {}
-
-    precedent_lines = []
-    for index, precedent in enumerate(precedents[:3], start=1):
-        precedent_lines.append(
-            {
-                "precedent_id": precedent["id"],
-                "rank": index,
-                "title": precedent["title"],
-                "primary_charge": precedent.get("primary_charge", ""),
-                "case_charges": precedent.get("case_charges", []),
-                "issue": precedent["issue"][:500],
-                "fact": precedent["fact"][:700],
-                "outcome": precedent["outcome"][:400],
-                "summary": precedent["summary"][:500],
-            }
-        )
-
-    prompt = f"""
-당신은 유사 판례의 쟁점을 현재 사건에 적용해 보완 질문을 만드는 보조자입니다.
-
-질문 작성 기준:
-- 판례 쟁점을 먼저 더 일반적인 사실 쟁점으로 바꾸세요.
-- 일반화한 쟁점을 사용자 사건에 적용하세요.
-- 질문은 사용자가 직접 겪은 상대방의 말, 행동, 상황 중 고소이유를 보강할 구체 사실을 묻는 문장으로 작성하세요.
-- 상대방이 설명하거나 약속한 내용이 쟁점과 연결되면, 그 설명이나 약속의 구체적 내용을 묻는 질문을 우선하세요.
-- 판례의 물건명, 금액, 날짜, 표현을 질문에 복사하지 마세요.
-- 사용자 사건에 없는 구체 사실을 질문에 넣지 마세요.
-- 법률 판단이나 죄명 성립 여부를 묻지 마세요.
-- 사용자가 왜 믿었는지, 어떻게 판단했는지, 신뢰한 이유가 무엇인지 묻지 마세요.
-- 부수 정황보다 판례 쟁점과 직접 연결되는 사실을 우선 질문하세요.
-- 예/아니오로 답할 수 있는 질문이 아니라, 구체적 사실을 묻는 질문으로 작성하세요.
-- 질문은 짧게 1개만 작성하세요.
-
-반드시 JSON만 출력하세요.
-{{
-  "items": [
-    {{
-      "precedent_id": "판례 id",
-      "precedent_issue": "판례에서 실제로 다룬 핵심 쟁점",
-      "issue_question": "사용자에게 물어볼 짧은 사실 질문 1개",
-      "relevance_reason": "현재 사건과 이 판례 쟁점이 연결되는 이유",
-      "how_to_use_in_complaint": "고소장 고소이유에 반영할 방향"
-    }}
-  ]
-}}
-
-사용자 사건:
-발생 일시: {payload.incident_date}
-발생 장소: {payload.incident_location}
-사건 내용: {payload.incident_description}
-증거 자료: {payload.evidence_summary}
-
-검색용 사건 요약:
-{fact_summary}
-
-유사 판례:
-{json.dumps(precedent_lines, ensure_ascii=False)}
-""".strip()
-
-    request_body = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": "당신은 유사 판례 쟁점을 사용자 답변용 사실 질문으로 바꾸는 보조자입니다."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.1,
-        "response_format": {"type": "json_object"},
-    }
-
-    url = f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions"
-    api_started = perf_counter()
-    async with httpx.AsyncClient(timeout=45) as client:
-        response = await client.post(
-            url,
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json=request_body,
-        )
-        response.raise_for_status()
-        data = response.json()
-    logger.info(
-        "[reference_timing] step=build_guidance_api ms=%.1f precedent_count=%s model=%s",
-        (perf_counter() - api_started) * 1000,
-        len(precedent_lines),
-        OPENAI_MODEL,
-    )
-
-    parsed = _parse_precedent_guidance_items(data)
-    logger.info(
-        "[reference_timing] step=build_guidance_total ms=%.1f item_count=%s",
-        (perf_counter() - started) * 1000,
-        len(parsed),
-    )
-    return parsed
-
-
-async def build_precedent_guidance(request: ReferenceGuidanceRequest) -> SimilarPrecedentItem:
-    fact_summary = request.fact_summary or _reference_query_text(request, [], "")
-    precedent_data = _precedent_item_to_guidance_input(request.precedent)
-    guidance_by_id = await _build_precedent_guidance_batch(request, fact_summary, [precedent_data])
-    selected_precedent = guidance_by_id.get(request.precedent.id) or _fallback_selected_precedent(precedent_data)
-    return _to_similar_precedent_item(precedent_data, selected_precedent)
 
 
 async def _rerank_precedents(
@@ -558,14 +258,7 @@ async def _rerank_precedents(
     fact_summary: str,
     precedents: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    started = perf_counter()
     if not OPENAI_API_KEY or len(precedents) <= DISPLAY_PRECEDENT_LIMIT:
-        logger.info(
-            "[reference_timing] step=rerank skipped=%s ms=%.1f candidate_count=%s",
-            "no_api_key" if not OPENAI_API_KEY else "not_enough_candidates",
-            (perf_counter() - started) * 1000,
-            len(precedents),
-        )
         return precedents[:DISPLAY_PRECEDENT_LIMIT]
 
     candidates = [
@@ -618,7 +311,6 @@ async def _rerank_precedents(
     }
 
     url = f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions"
-    api_started = perf_counter()
     async with httpx.AsyncClient(timeout=45) as client:
         response = await client.post(
             url,
@@ -627,12 +319,6 @@ async def _rerank_precedents(
         )
         response.raise_for_status()
         data = response.json()
-    logger.info(
-        "[reference_timing] step=rerank_api ms=%.1f candidate_count=%s model=%s",
-        (perf_counter() - api_started) * 1000,
-        len(candidates),
-        OPENAI_MODEL,
-    )
 
     ranked_ids = _parse_reranked_ids(data, candidate_ids)
     by_id = {precedent["id"]: precedent for precedent in precedents}
@@ -643,105 +329,334 @@ async def _rerank_precedents(
         if len(reranked) >= DISPLAY_PRECEDENT_LIMIT:
             break
 
-    logger.info(
-        "[reference_timing] step=rerank_total ms=%.1f ranked_ids=%s",
-        (perf_counter() - started) * 1000,
-        [precedent["id"] for precedent in reranked[:DISPLAY_PRECEDENT_LIMIT]],
-    )
     return reranked[:DISPLAY_PRECEDENT_LIMIT]
 
 
-async def _search_reference_precedents(
-    db: AsyncSession,
+async def _build_precedent_guidance_batch(
     payload: ReferenceSearchRequest,
     fact_summary: str,
-    terms: list[str],
-    charge_candidates: list[str],
-) -> list[SimilarPrecedentItem]:
-    def unique_precedents(precedents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        results = []
-        seen_ids = set()
-        for precedent in precedents:
-            precedent_id = precedent.get("id")
-            if precedent_id in seen_ids:
-                continue
-            seen_ids.add(precedent_id)
-            results.append(precedent)
-            if len(results) >= SEARCH_CANDIDATE_LIMIT:
-                break
-        return results
+    precedents: list[dict[str, Any]],
+) -> dict[str, dict[str, str]]:
+    if not OPENAI_API_KEY or not precedents:
+        return {}
 
-    search_started = perf_counter()
-    searched_precedents = await _search_similar_precedents(
-        db,
-        fact_summary,
-        terms,
-        charge_candidates,
-    )
-    unique_results = unique_precedents(searched_precedents)
-    logger.info(
-        "[reference_timing] step=search_fact_candidates ms=%.1f candidate_count=%s unique_count=%s charges=%s",
-        (perf_counter() - search_started) * 1000,
-        len(searched_precedents),
-        len(unique_results),
-        charge_candidates,
-    )
-    for index, precedent in enumerate(unique_results, start=1):
-        logger.info(
-            "[reference_timing] step=fact_candidate rank=%s distance=%.6f title=%s",
-            index,
-            precedent.get("distance", 0),
-            precedent.get("title", ""),
-        )
-    reranked_results = await _rerank_precedents(payload, fact_summary, unique_results)
-    return [_to_precedent_search_item(precedent) for precedent in reranked_results]
-
-
-async def analyze_reference_points(
-    db: AsyncSession,
-    payload: ReferenceSearchRequest,
-    analysis: ReferenceAnalysis,
-    usage_limit: int,
-    usage_used: int,
-    usage_remaining: int,
-) -> ReferenceAnalyzeResponse:
-    started = perf_counter()
-    fact_summary = analysis.search_query or _reference_query_text(payload, analysis.search_keywords, "")
-    if not analysis.is_meaningful_case or not fact_summary:
-        logger.info("[reference_timing] step=analyze_reference_points skipped=not_meaningful ms=%.1f", (perf_counter() - started) * 1000)
-        return ReferenceAnalyzeResponse(
-            is_meaningful_case=analysis.is_meaningful_case,
-            invalid_reason=analysis.invalid_reason,
-            fact_summary=fact_summary,
-            similar_precedent=None,
-            similar_precedents=[],
-            usage_limit=usage_limit,
-            usage_used=usage_used,
-            usage_remaining=usage_remaining,
+    precedent_lines = []
+    for index, precedent in enumerate(precedents[:3], start=1):
+        precedent_lines.append(
+            {
+                "precedent_id": precedent["id"],
+                "rank": index,
+                "title": precedent["title"],
+                "primary_charge": precedent.get("primary_charge", ""),
+                "case_charges": precedent.get("case_charges", []),
+                "issue": precedent["issue"][:500],
+                "fact": precedent["fact"][:700],
+                "outcome": precedent["outcome"][:400],
+                "summary": precedent["summary"][:500],
+            }
         )
 
-    terms = _dedupe_keywords(analysis.search_keywords)
-    similar_precedents = await _search_reference_precedents(
-        db,
-        payload,
-        fact_summary,
-        terms,
-        analysis.charge_candidates,
-    )
-    similar_precedent = similar_precedents[0] if similar_precedents else None
-    logger.info(
-        "[reference_timing] step=analyze_reference_points_total ms=%.1f result_count=%s",
-        (perf_counter() - started) * 1000,
-        len(similar_precedents),
+    prompt = f"""
+당신은 사용자의 사건 내용과 사용자가 선택한 판례 1개를 비교해, 고소장에 필요한 추가 사실 질문을 만드는 보조자입니다.
+
+기준:
+- 질문은 2~3개만 작성하세요.
+- 일시, 장소, 사건 관련자의 말과 행동, 행위 방법, 피해 발생 과정, 피해 결과, 사건 전후 사정이 더 구체화될 필요가 있으면 질문하세요.
+- 선택한 판례의 주요 쟁점을 확인하고, 현재 사건에 적용 가능성이 있는 사실 요소가 있으면 그 부분을 질문으로 바꾸어 물으세요.
+- 법률 판단이나 결론을 사용자에게 묻지 말고, 사용자가 직접 겪은 구체적 사실을 묻는 문장으로 작성하세요.
+- 질문 문장에서는 '저는', '제가', '저에게'를 쓰지 말고, '본인', '당신', '사용자' 중 자연스러운 표현으로 물으세요.
+- 질문은 막연한 기억이나 감상을 묻지 말고, 누가, 언제, 어디서, 무엇을, 어떻게 했는지 확인하는 문장으로 작성하세요.
+- 감정이나 처벌 의사 자체를 묻는 질문은 피하세요.
+- 사용자가 말하지 않은 사실을 단정해서 전제로 삼지 말고, 예/아니오 질문은 피하세요.
+
+반드시 JSON만 출력하세요.
+{{
+  "items": [
+    {{
+      "precedent_id": "판례 id",
+      "precedent_issue": "선택한 판례의 쟁점",
+      "missing_fact_points": [
+        "사용자 사건에서 빠져 있거나 부족한 핵심 사실관계"
+      ],
+      "generalized_issue": "현재 사건에서 확인할 사실 요소",
+      "issue_questions": [
+        "사용자에게 물어볼 구체적 사실 질문 1",
+        "사용자에게 물어볼 구체적 사실 질문 2"
+      ],
+      "relevance_reason": "선택한 판례와 현재 사건이 연결되는 이유",
+      "how_to_use_in_complaint": "답변을 범죄사실 또는 고소이유에 반영할 방향"
+    }}
+  ]
+}}
+
+사용자 사건:
+발생 일시: {payload.incident_date}
+발생 장소: {payload.incident_location}
+사건 내용: {payload.incident_description}
+증거 자료: {payload.evidence_summary}
+
+검색용 사건 요약:
+{fact_summary}
+
+선택한 판례:
+{json.dumps(precedent_lines, ensure_ascii=False)}
+""".strip()
+
+    request_body = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": "당신은 형사 고소장에 필요한 추가 사실을 사용자 질문으로 정리하는 보조자입니다."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+
+    url = f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions"
+    async with httpx.AsyncClient(timeout=45) as client:
+        response = await client.post(
+            url,
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json=request_body,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    parsed = _parse_precedent_guidance_items(data)
+    return parsed
+
+
+def _to_precedent_search_item(precedent: dict[str, Any]) -> SimilarPrecedentItem:
+    return SimilarPrecedentItem(
+        id=precedent["id"],
+        title=precedent["title"],
+        charge=precedent.get("matched_charge") or precedent.get("primary_charge", ""),
+        charges=precedent.get("case_charges", []),
+        source_url=precedent.get("source_url", ""),
+        issue=precedent.get("issue", ""),
+        summary=precedent.get("summary", ""),
+        fact=precedent.get("fact", ""),
+        outcome=precedent.get("outcome", ""),
     )
 
-    return ReferenceAnalyzeResponse(
-        is_meaningful_case=analysis.is_meaningful_case,
-        invalid_reason=analysis.invalid_reason,
-        fact_summary=fact_summary,
-        similar_precedent=similar_precedent,
-        similar_precedents=similar_precedents,
-        usage_limit=usage_limit,
-        usage_used=usage_used,
-        usage_remaining=usage_remaining,
+
+def _precedent_item_to_guidance_input(precedent: SimilarPrecedentItem) -> dict[str, Any]:
+    case_charges = precedent.charges or ([precedent.charge] if precedent.charge else [])
+    return {
+        "id": precedent.id,
+        "title": precedent.title,
+        "primary_charge": precedent.charge,
+        "case_charges": case_charges,
+        "source_url": precedent.source_url,
+        "issue": precedent.issue,
+        "fact": precedent.fact or precedent.summary,
+        "outcome": precedent.outcome,
+        "summary": precedent.summary,
+    }
+
+
+def _to_similar_precedent_item(
+    precedent: dict[str, Any],
+    selected_precedent: dict[str, str],
+) -> SimilarPrecedentItem:
+    return SimilarPrecedentItem(
+        id=precedent["id"],
+        title=precedent["title"],
+        charge=precedent.get("matched_charge") or precedent["primary_charge"],
+        charges=precedent.get("case_charges", []),
+        source_url=precedent["source_url"],
+        issue=selected_precedent["precedent_issue"],
+        summary=precedent["summary"],
+        fact=precedent.get("fact", ""),
+        outcome=precedent.get("outcome", ""),
+        question=selected_precedent["issue_question"],
+        selection_reason=selected_precedent["selection_reason"],
+        how_to_use_in_complaint=selected_precedent["how_to_use_in_complaint"],
     )
+
+
+def _fallback_selected_precedent(precedent: dict[str, Any]) -> dict[str, str]:
+    issue = _normalize_search_text(precedent["issue"] or "이 판례에서 다룬 핵심 쟁점")
+    return {
+        "precedent_id": precedent["id"],
+        "precedent_issue": issue,
+        "issue_question": f"'{issue}'와 관련해 현재 사건에서 추가로 설명할 사실이 있나요?",
+        "selection_reason": "fact 유사도 기준으로 가장 가까운 판례입니다.",
+        "how_to_use_in_complaint": "고소이유에서는 사용자 사건의 구체적 사실관계와 참고판례의 핵심 쟁점이 연결되는 부분을 조심스럽게 설명합니다.",
+    }
+
+
+def _parse_reference_analysis(data: dict[str, Any], fallback_query: str) -> ReferenceAnalysis:
+    choices = data.get("choices") or []
+    if not choices:
+        raise ValueError("OpenAI 응답에 검색 정보가 없습니다.")
+    text_value = ((choices[0].get("message") or {}).get("content") or "").strip()
+    parsed = json.loads(text_value)
+    if not isinstance(parsed, dict):
+        raise ValueError("검색 정보 응답 형식이 올바르지 않습니다.")
+
+    raw_keywords = parsed.get("search_keywords") or []
+    raw_candidates = parsed.get("charge_candidates") or []
+    search_query = _normalize_search_text(str(parsed.get("search_query") or fallback_query))
+    return ReferenceAnalysis(
+        charge_candidates=_normalize_charge_candidates(raw_candidates if isinstance(raw_candidates, list) else []),
+        is_meaningful_case=bool(parsed.get("is_meaningful_case", True)),
+        invalid_reason=_normalize_search_text(str(parsed.get("invalid_reason") or "")),
+        search_keywords=_dedupe_keywords(raw_keywords if isinstance(raw_keywords, list) else []),
+        search_query=search_query,
+    )
+
+
+def _parse_reranked_ids(data: dict[str, Any], candidate_ids: list[str]) -> list[str]:
+    choices = data.get("choices") or []
+    if not choices:
+        return []
+    text_value = ((choices[0].get("message") or {}).get("content") or "").strip()
+    parsed = json.loads(text_value)
+    ranked_ids = parsed.get("ranked_ids") if isinstance(parsed, dict) else None
+    if not isinstance(ranked_ids, list):
+        return []
+
+    allowed = set(candidate_ids)
+    results = []
+    for value in ranked_ids:
+        precedent_id = str(value or "").strip()
+        if precedent_id in allowed and precedent_id not in results:
+            results.append(precedent_id)
+    return results
+
+
+def _parse_precedent_guidance_items(data: dict[str, Any]) -> dict[str, dict[str, str]]:
+    choices = data.get("choices") or []
+    if not choices:
+        return {}
+    text_value = ((choices[0].get("message") or {}).get("content") or "").strip()
+    parsed = json.loads(text_value)
+    items = parsed.get("items") if isinstance(parsed, dict) else None
+    if not isinstance(items, list):
+        return {}
+
+    results = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        precedent_id = str(item.get("precedent_id") or "").strip()
+        precedent_issue = _normalize_search_text(str(item.get("precedent_issue") or ""))
+        issue_questions = _normalize_issue_questions(item)
+        issue_question = "\n".join(f"{index}. {question}" for index, question in enumerate(issue_questions, start=1))
+        if not precedent_id or not precedent_issue or not issue_question:
+            continue
+        results[precedent_id] = {
+            "precedent_id": precedent_id,
+            "precedent_issue": precedent_issue,
+            "issue_question": issue_question,
+            "selection_reason": _normalize_search_text(str(item.get("relevance_reason") or item.get("selection_reason") or "")),
+            "how_to_use_in_complaint": _normalize_search_text(str(item.get("how_to_use_in_complaint") or "")),
+        }
+    return results
+
+
+def _normalize_issue_questions(item: dict[str, Any]) -> list[str]:
+    raw_questions = item.get("issue_questions")
+    if isinstance(raw_questions, list):
+        questions = [_normalize_search_text(str(value or "")) for value in raw_questions]
+    else:
+        fallback = item.get("issue_question") or item.get("question") or ""
+        questions = [_normalize_search_text(str(fallback))]
+
+    results = []
+    for question in questions:
+        if question and question not in results:
+            results.append(question)
+        if len(results) >= 3:
+            break
+    return results
+
+
+def _reference_query_text(payload: ReferenceSearchRequest, search_keywords: list[str], search_query: str) -> str:
+    return " ".join(
+        [
+            search_query,
+            payload.incident_location,
+            payload.incident_description,
+            " ".join(search_keywords),
+        ]
+    ).strip()
+
+
+def _charge_filter_sql(charge_labels: list[str]) -> tuple[str, dict[str, str]]:
+    labels = [label for label in charge_labels[:4] if label]
+    if not labels:
+        return "", {}
+
+    clauses = []
+    params = {}
+    for index, label in enumerate(labels):
+        label_key = f"label_{index}"
+        params[label_key] = label
+        clauses.append(f"jsonb_exists(p.charges, :{label_key})")
+    return "AND (" + " OR ".join(clauses) + ")", params
+
+
+def _precedent_title(row) -> str:
+    court = _normalize_search_text(str(getattr(row, "court_name", "") or ""))
+    date = _normalize_search_text(str(getattr(row, "verdict_date", "") or ""))
+    number = _normalize_search_text(str(getattr(row, "case_number", "") or ""))
+    pieces = [piece for piece in [court, date] if piece]
+    title = " · ".join(pieces) or "판례"
+    if number:
+        title = f"{title} ({number})"
+    return title
+
+
+def _best_excerpt(row, terms: list[str], max_length: int = 260) -> str:
+    candidates = [
+        _normalize_search_text(str(row.chunk_text or "")),
+        _normalize_search_text(str(row.fact_context or "")),
+        _normalize_search_text(str(row.holding or "")),
+    ]
+    text_value = next((candidate for candidate in candidates if candidate), "")
+    if len(text_value) <= max_length:
+        return text_value
+
+    hit_positions = [text_value.find(term) for term in terms if term and text_value.find(term) >= 0]
+    if hit_positions:
+        center = min(hit_positions)
+        start = max(0, center - 70)
+        end = min(len(text_value), start + max_length)
+        start = max(0, end - max_length)
+        prefix = "..." if start > 0 else ""
+        suffix = "..." if end < len(text_value) else ""
+        return f"{prefix}{text_value[start:end].rstrip()}{suffix}"
+    return text_value[:max_length].rstrip() + "..."
+
+
+def _normalize_charge_candidates(values: list[Any]) -> list[str]:
+    canonical_set = set(CANONICAL_CHARGES)
+    seen = set()
+    results = []
+    for value in values:
+        cleaned = _normalize_search_text(str(value or "")).replace(" ", "")
+        if cleaned not in canonical_set or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        results.append(cleaned)
+        if len(results) >= 3:
+            break
+    return results
+
+
+def _dedupe_keywords(keywords: list[str]) -> list[str]:
+    seen = set()
+    results = []
+    for keyword in keywords:
+        cleaned = str(keyword or "").strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        results.append(cleaned)
+    return results[:20]
+
+
+def _normalize_search_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()

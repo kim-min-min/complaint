@@ -78,10 +78,16 @@ function toRequestBody(formData) {
 
 function coreReferenceText(precedent, answer) {
   if (!precedent) return '';
+  const questions = guidanceQuestions(precedent.question);
+  const answers = guidanceAnswers(answer, questions.length);
+  const answerText = answers
+    .map((value, index) => (value?.trim() ? `${index + 1}. ${value.trim()}` : ''))
+    .filter(Boolean)
+    .join('\n');
   return [
     '고소이유 보완',
     precedent.question ? `질문: ${precedent.question}` : '',
-    answer?.trim() ? `답변: ${answer.trim()}` : '',
+    answerText ? `답변: ${answerText}` : '',
     '',
     '참고판례',
     `판례: ${precedent.title}`,
@@ -107,10 +113,64 @@ function selectedChargeText(precedents, selectedIds) {
   const charges = [];
   for (const precedent of precedents || []) {
     if (!selectedIds.includes(referenceKey(precedent))) continue;
-    const charge = (precedent.charge || '').trim();
-    if (charge && !charges.includes(charge)) charges.push(charge);
+    const precedentCharges = Array.isArray(precedent.charges) && precedent.charges.length
+      ? precedent.charges
+      : [precedent.charge];
+    for (const value of precedentCharges) {
+      const charge = (value || '').trim();
+      if (charge && !charges.includes(charge)) charges.push(charge);
+    }
   }
   return charges.join(', ');
+}
+
+function precedentChargeList(precedent) {
+  const values = Array.isArray(precedent?.charges) && precedent.charges.length
+    ? precedent.charges
+    : [precedent?.charge];
+  return values.map((value) => (value || '').trim()).filter(Boolean);
+}
+
+function guidanceQuestions(questionText) {
+  const text = (questionText || '').trim();
+  if (!text) return [];
+  const matches = [...text.matchAll(/(?:^|\s)(\d+)\.\s*([\s\S]*?)(?=\s+\d+\.\s*|$)/g)];
+  const parsed = matches.map((match) => (match[2] || '').trim()).filter(Boolean);
+  return parsed.length ? parsed : [text];
+}
+
+function guidanceAnswers(answerText, count) {
+  const text = (answerText || '').trim();
+  const answers = Array(count).fill('');
+  if (!text) return answers;
+  if (/^\d+\.?$/.test(text)) return answers;
+
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return answers.map((_, index) => String(parsed[index] || ''));
+    }
+  } catch {
+    // Older drafts stored numbered plain text; keep supporting that format.
+  }
+
+  const matches = [...text.matchAll(/(?:^|\n)\s*(\d+)\.\s*([\s\S]*?)(?=\n\s*\d+\.\s*|$)/g)];
+  if (matches.length) {
+    for (const match of matches) {
+      const index = Number(match[1]) - 1;
+      if (index >= 0 && index < count) answers[index] = (match[2] || '').trim();
+    }
+    return answers;
+  }
+
+  answers[0] = text;
+  return answers;
+}
+
+function updateGuidanceAnswer(answerText, count, index, value) {
+  const answers = guidanceAnswers(answerText, count);
+  answers[index] = value;
+  return JSON.stringify(answers);
 }
 
 export default function AnalysisPage() {
@@ -175,9 +235,9 @@ export default function AnalysisPage() {
         setSelectedPrecedentIds((prev) => {
           const validIds = precedents.map(referenceKey).filter(Boolean);
           const prevValid = prev.filter((id) => validIds.includes(id));
-          if (prevValid.length) return prevValid;
+          if (prevValid.length) return [prevValid[0]];
           const savedValid = (draftSnapshot.selectedPrecedentIds || []).filter((id) => validIds.includes(id));
-          if (savedValid.length) return savedValid;
+          if (savedValid.length) return [savedValid[0]];
           return [];
         });
         setCoreAnswers((prev) => prev || draftSnapshot.issueAnswers || {});
@@ -246,7 +306,7 @@ export default function AnalysisPage() {
         }).then(async (response) => {
           const data = await readApiResponse(response);
           if (response.status === 401) return { unauthorized: true };
-          if (!response.ok) throw new Error(formatApiError(data, '판례 쟁점 질문 생성에 실패했습니다.'));
+          if (!response.ok) throw new Error(formatApiError(data, '보완 질문 생성에 실패했습니다.'));
           return data;
         }));
       }
@@ -255,10 +315,14 @@ export default function AnalysisPage() {
         navigate('/login');
         return;
       }
-      setCorePrecedents((prev) => prev.map((item) => (referenceKey(item) === id ? { ...item, ...guidedPrecedent } : item)));
+      setCorePrecedents((prev) => prev.map((item) => (
+        referenceKey(item) === id
+          ? { ...item, ...guidedPrecedent, charges: guidedPrecedent.charges?.length ? guidedPrecedent.charges : item.charges }
+          : item
+      )));
     } catch (err) {
       setSelectedPrecedentIds((prev) => prev.filter((item) => item !== id));
-      setError(err.message || '판례 쟁점 질문 생성 중 오류가 발생했습니다.');
+      setError(err.message || '보완 질문 생성 중 오류가 발생했습니다.');
     } finally {
       setGuidanceLoadingIds((prev) => prev.filter((item) => item !== id));
     }
@@ -268,16 +332,16 @@ export default function AnalysisPage() {
     const id = referenceKey(precedent);
     if (!id) return;
     if (!checked) {
-      setSelectedPrecedentIds((prev) => prev.filter((item) => item !== id));
+      setSelectedPrecedentIds([]);
       return;
     }
-    setSelectedPrecedentIds((prev) => [...new Set([...prev, id])]);
+    setSelectedPrecedentIds([id]);
   };
 
   const handleProceedToGuidance = async () => {
     if (!canProceedToGuidance) return;
     setPageMode('guidance');
-    setStatusMessage('선택한 판례의 쟁점을 현재 사건에 맞춰 질문으로 바꾸고 있습니다.');
+    setStatusMessage('고소장에 필요한 추가 사실을 질문으로 정리하고 있습니다.');
     await Promise.all(selectedPrecedents.map((precedent) => buildGuidance(precedent)));
     setStatusMessage('');
   };
@@ -340,13 +404,8 @@ export default function AnalysisPage() {
         <header className="mb-7">
           <p className="text-sm font-semibold text-[#50534e]">유사 판례</p>
           <h1 className="mt-2 text-3xl font-semibold tracking-normal text-[#111111]">
-            {pageMode === 'select' ? '고소장에 반영할 판례를 선택해주세요' : '판례 쟁점에 대해 보완해주세요'}
+            {pageMode === 'select' ? '고소장에 반영할 판례를 선택해주세요' : '고소장에 필요한 사실을 보완해주세요'}
           </h1>
-          <p className="mt-3 text-sm leading-6 text-[#5f625d]">
-            {pageMode === 'select'
-              ? '입력한 사건과 가까운 판례를 찾았습니다. 참고할 판례를 선택해주세요.'
-              : '선택한 판례의 쟁점을 현재 사건에 맞춰 질문으로 정리했습니다.'}
-          </p>
           {usage && (
             <p className="mt-3 inline-flex rounded-full border border-[#d7d9d2] bg-[#eef2e8] px-4 py-2 text-sm font-semibold text-[#3d4a35]">
               오늘 남은 AI 요청 {usage.remaining}회 / {usage.limit}회
@@ -355,8 +414,9 @@ export default function AnalysisPage() {
         </header>
 
         {loading && (
-          <div className="rounded-[6px] border border-[#d7d9d2] bg-[#fbfbf8] p-5 text-sm font-semibold text-[#3d4a35]">
-            입력한 사건 내용을 바탕으로 가까운 판례를 찾고 있습니다.
+          <div className="flex items-center gap-3 rounded-[6px] border border-[#d7d9d2] bg-[#fbfbf8] p-5 text-sm font-semibold text-[#3d4a35]">
+            <span className="h-4 w-4 animate-spin rounded-full border-2 border-[#c4c9bd] border-t-[#3d4a35]" aria-hidden="true" />
+            <span>{statusMessage || '입력한 사건 내용을 바탕으로 가까운 판례를 찾고 있습니다.'}</span>
           </div>
         )}
 
@@ -374,12 +434,15 @@ export default function AnalysisPage() {
                 {(pageMode === 'select' ? corePrecedents : selectedPrecedents).map((precedent) => {
                   const id = referenceKey(precedent);
                   const selected = selectedPrecedentIds.includes(id);
+                  const questions = guidanceQuestions(precedent.question);
+                  const answers = guidanceAnswers(coreAnswers[id], questions.length);
                   return (
                     <article key={id} className={`rounded-[6px] border bg-[#fbfbf8] p-5 shadow-[0_18px_44px_rgba(30,32,27,0.06)] ${selected ? 'border-[#111111]' : 'border-[#d7d9d2]'}`}>
                       <div className="flex flex-wrap items-start justify-between gap-4">
                         <label className="flex items-start gap-3">
                         <input
-                          type="checkbox"
+                          type="radio"
+                          name="selected-precedent"
                           checked={selected}
                           disabled={pageMode === 'guidance'}
                           onChange={(event) => handlePrecedentSelection(precedent, event.target.checked)}
@@ -397,10 +460,16 @@ export default function AnalysisPage() {
                         )}
                       </div>
 
-                        {precedent.issue && (
+                        {precedentChargeList(precedent).length > 0 && (
                           <div className="mt-4">
-                            <p className="text-xs font-semibold text-[#6b6e66]">쟁점</p>
-                            <p className="mt-2 whitespace-pre-wrap break-keep text-sm leading-6 text-[#22231f]">{precedent.issue}</p>
+                            <p className="text-xs font-semibold text-[#6b6e66]">죄명</p>
+                            <div className="mt-2 flex flex-wrap gap-2">
+                              {precedentChargeList(precedent).map((charge) => (
+                                <span key={charge} className="rounded-full border border-[#d7d9d2] bg-[#eef2e8] px-3 py-1 text-xs font-semibold text-[#3d4a35]">
+                                  {charge}
+                                </span>
+                              ))}
+                            </div>
                           </div>
                         )}
 
@@ -411,23 +480,39 @@ export default function AnalysisPage() {
                           </div>
                         )}
 
+                        {precedent.issue && (
+                          <div className="mt-4">
+                            <p className="text-xs font-semibold text-[#6b6e66]">쟁점</p>
+                            <p className="mt-2 whitespace-pre-wrap break-keep text-sm leading-6 text-[#22231f]">{precedent.issue}</p>
+                          </div>
+                        )}
+
                       {pageMode === 'guidance' && guidanceLoadingIds.includes(id) && (
                         <div className="mt-5 rounded-[4px] border border-[#cbd8bd] bg-[#eef2e8] px-4 py-3 text-sm font-semibold text-[#3d4a35]">
-                          선택한 판례의 쟁점을 현재 사건에 맞춰 질문으로 바꾸고 있습니다.
+                          고소장에 필요한 추가 사실을 질문으로 정리하고 있습니다.
                         </div>
                       )}
 
-                      {pageMode === 'guidance' && precedent.question && (
-                        <>
-                          <p className="mt-5 text-base font-semibold leading-7 text-[#111111]">{precedent.question}</p>
-                          <textarea
-                            value={coreAnswers[id] || ''}
-                            onChange={(event) => setCoreAnswers((prev) => ({ ...prev, [id]: event.target.value }))}
-                            rows={5}
-                            placeholder="답변을 입력하세요"
-                            className="mt-4 w-full resize-y rounded-[4px] border border-[#d7d9d2] bg-white px-3 py-2 text-sm leading-6 text-[#111111] outline-none transition placeholder:text-[#8b8e86] focus:border-[#111111] focus:ring-2 focus:ring-[#e9efe3]"
-                          />
-                        </>
+                      {pageMode === 'guidance' && questions.length > 0 && (
+                        <div className="mt-5 space-y-5">
+                          {questions.map((question, questionIndex) => (
+                            <div key={`${id}-question-${questionIndex}`}>
+                              <p className="text-base font-semibold leading-7 text-[#111111]">
+                                {questionIndex + 1}. {question}
+                              </p>
+                              <textarea
+                                value={answers[questionIndex] || ''}
+                                onChange={(event) => setCoreAnswers((prev) => ({
+                                  ...prev,
+                                  [id]: updateGuidanceAnswer(prev[id] || '', questions.length, questionIndex, event.target.value),
+                                }))}
+                                rows={4}
+                                placeholder="답변을 입력하세요"
+                                className="mt-3 w-full resize-y rounded-[4px] border border-[#d7d9d2] bg-white px-3 py-2 text-sm leading-6 text-[#111111] outline-none transition placeholder:text-[#8b8e86] focus:border-[#111111] focus:ring-2 focus:ring-[#e9efe3]"
+                              />
+                            </div>
+                          ))}
+                        </div>
                       )}
                     </article>
                   );

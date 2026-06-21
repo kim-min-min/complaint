@@ -68,8 +68,16 @@ def _blank_line(width_mm: int) -> str:
 def _legal_references_text(payload: ComplaintGenerateRequest) -> str:
     if not payload.legal_references:
         return ""
-    items = "\n".join(f"- {item}" for item in payload.legal_references[:10])
+    items = "\n".join(f"- {_reference_title(item)}" for item in payload.legal_references[:10] if _reference_title(item))
     return f"※ 참고판례\n{items}"
+
+
+def _reference_title(value: str) -> str:
+    for line in str(value or "").splitlines():
+        cleaned = line.strip()
+        if cleaned.startswith("판례:"):
+            return cleaned
+    return ""
 
 
 def _normalize_reference_heading(text: str) -> str:
@@ -97,6 +105,10 @@ def _reason_with_references(reason: str, payload: ComplaintGenerateRequest) -> s
     if not references or "참고판례" in reason:
         return reason
     return f"{reason.rstrip()}\n\n{references}"
+
+
+def _default_purpose() -> str:
+    return "저는 피고소인의 위 행위에 대하여 고소하오니 철저히 수사하여 법에 따라 처벌하여 주시기 바랍니다."
 
 
 def _paragraph_block(text: str, style: ParagraphStyle, min_height_mm: int = 80) -> Table:
@@ -236,11 +248,18 @@ def _annex_person_table(styles: dict) -> Table:
     return table
 
 
-def _annex_document_table(styles: dict) -> Table:
+def _annex_document_table(styles: dict, evidence_names: list[str]) -> Table:
     data = [[_p("순번", styles["cell_center"]), _p("증거", styles["cell_center"]), _p("작성자", styles["cell_center"]), _p("제출 유무", styles["cell_center"])]]
-    for idx in range(1, 6):
-        data.append([_p(str(idx), styles["cell_center"]), _p("", styles["cell"]), _p("", styles["cell"]), _p("□ 접수시 제출  □ 수사 중 제출", styles["cell_center"])])
-    table = Table(data, colWidths=[13 * mm, 57 * mm, 30 * mm, 70 * mm], rowHeights=[13 * mm] + [14 * mm] * 5)
+    rows = evidence_names[:10]
+    rows.extend([""] * max(0, 5 - len(rows)))
+    for idx, name in enumerate(rows, start=1):
+        data.append([
+            _p(str(idx), styles["cell_center"]),
+            _p(name, styles["cell"]),
+            _p("고소인" if name else "", styles["cell_center"]),
+            _p("■ 접수시 제출  □ 수사 중 제출" if name else "□ 접수시 제출  □ 수사 중 제출", styles["cell_center"]),
+        ])
+    table = Table(data, colWidths=[13 * mm, 57 * mm, 30 * mm, 70 * mm], rowHeights=[13 * mm] + [14 * mm] * len(rows))
     table.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.8, colors.black), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
     return table
 
@@ -254,7 +273,8 @@ def _annex_object_table(styles: dict) -> Table:
     return table
 
 
-def _append_evidence_annex(story: list, styles: dict) -> None:
+def _append_evidence_annex(story: list, styles: dict, payload: ComplaintGenerateRequest) -> None:
+    evidence_names = _evidence_names(payload)
     story.append(PageBreak())
     story.append(Spacer(1, 4 * mm))
     story.append(_p("별지 : 증거자료 세부 목록", styles["annex_title"]))
@@ -268,7 +288,7 @@ def _append_evidence_annex(story: list, styles: dict) -> None:
     story.append(Spacer(1, 9 * mm))
     story.append(_p("2. 증거서류 (진술서, 차용증, 각서, 금융거래내역서, 진단서 등)", styles["annex_heading"]))
     story.append(Spacer(1, 6 * mm))
-    story.append(_annex_document_table(styles))
+    story.append(_annex_document_table(styles, evidence_names))
     story.append(Spacer(1, 5 * mm))
     story.append(_p("※ 증거란에 각 증거서류를 개별적으로 기재하고, 제출 유무란에는 고소장 접수시 제출하는지 또는 수사 중 제출할 예정인지 표시하시기 바랍니다.", styles["small"]))
     story.append(PageBreak())
@@ -288,6 +308,56 @@ def _append_text_appendix(story: list, styles: dict, title: str, text: str) -> N
     story.append(_p(title, styles["annex_title"]))
     story.append(Spacer(1, 8 * mm))
     story.append(_p(_clean(text, " "), styles["body"]))
+
+
+def _evidence_names(payload: ComplaintGenerateRequest) -> list[str]:
+    names = []
+    for value in payload.attachments:
+        cleaned = _clean(value)
+        if cleaned:
+            names.append(cleaned)
+    for attachment in payload.evidence_attachments:
+        cleaned = _clean(attachment.name)
+        if cleaned and cleaned not in names:
+            names.append(cleaned)
+    return names
+
+
+def _evidence_list_text(payload: ComplaintGenerateRequest) -> str:
+    return "\n".join(f"{index}. {name}" for index, name in enumerate(_evidence_names(payload), start=1))
+
+
+def _image_flowable(data_base64: str, max_width: float, max_height: float):
+    if not data_base64:
+        return None
+    try:
+        import base64
+        from reportlab.platypus import Image
+
+        raw = base64.b64decode(data_base64, validate=True)
+        image = Image(BytesIO(raw))
+        scale = min(max_width / image.imageWidth, max_height / image.imageHeight)
+        image.drawWidth = image.imageWidth * scale
+        image.drawHeight = image.imageHeight * scale
+        return image
+    except Exception:
+        return None
+
+
+def _append_evidence_images(story: list, styles: dict, payload: ComplaintGenerateRequest) -> None:
+    max_width = 170 * mm
+    max_height = 220 * mm
+    for index, attachment in enumerate(payload.evidence_attachments, start=1):
+        image = _image_flowable(attachment.data_base64, max_width, max_height)
+        if image is None:
+            continue
+        story.append(PageBreak())
+        story.append(Spacer(1, 4 * mm))
+        story.append(_p(f"증거 {index}. {_clean(attachment.name, attachment.filename or '증거자료')}", styles["annex_title"]))
+        if _clean(attachment.filename):
+            story.append(_p(f"파일명: {attachment.filename}", styles["small"]))
+        story.append(Spacer(1, 8 * mm))
+        story.append(image)
 
 
 def build_complaint_pdf(payload: ComplaintGenerateRequest, complaint_text: str) -> bytes:
@@ -310,10 +380,9 @@ def build_complaint_pdf(payload: ComplaintGenerateRequest, complaint_text: str) 
         _extract_section(complaint_text, 5, "피고소인의 행위 경위와 정황, 고소를 하게 된 동기와 사유는 범죄사실 기재 내용과 같습니다."),
         payload,
     )
-    evidence = _extract_section(complaint_text, 6, _clean(payload.evidence_summary, "□ 고소인은 고소인의 진술 외에 제출할 증거가 없습니다."))
+    evidence = _evidence_list_text(payload)
     station = _clean(payload.police_station, _blank_line(18))
-    charge = _clean(payload.charge_name, _blank_line(12))
-    purpose = _extract_section(complaint_text, 3, f"고소인은 피고소인을 {charge}로 고소하오니 처벌하여 주시기 바랍니다.")
+    purpose = _extract_section(complaint_text, 3, _default_purpose())
     facts_needs_appendix = _needs_appendix(facts, max_chars=900, max_lines=13)
     reason_needs_appendix = _needs_appendix(reason, max_chars=780, max_lines=12)
     facts_main = "별지 범죄사실 기재와 같습니다." if facts_needs_appendix else facts
@@ -346,14 +415,16 @@ def build_complaint_pdf(payload: ComplaintGenerateRequest, complaint_text: str) 
     story.append(PageBreak())
     story.extend(_section("6. 증거자료", styles["heading"], 0))
     story.append(_p("(■ 해당란에 체크하여 주시기 바랍니다)", styles["subtitle"]))
-    has_evidence = bool(evidence.strip() or payload.attachments)
+    has_evidence = bool(evidence.strip() or payload.evidence_attachments)
     story.append(_p(("□ 고소인은 고소인의 진술 외에 제출할 증거가 없습니다.\n■ 고소인은 고소인의 진술 외에 제출할 증거가 있습니다." if has_evidence else "■ 고소인은 고소인의 진술 외에 제출할 증거가 없습니다.\n□ 고소인은 고소인의 진술 외에 제출할 증거가 있습니다."), styles["body"]))
-    story.append(_p(f"☞ 제출할 증거의 세부내역은 별지를 작성하여 첨부합니다.\n{evidence}", styles["body"]))
+    if has_evidence:
+        story.append(_p(f"☞ 제출할 증거의 세부내역은 별지를 작성하여 첨부합니다.\n{evidence}", styles["body"]))
     story.extend(_section("7. 관련사건의 수사 및 재판 여부*", styles["heading"], 8))
     story.append(_p("(■ 해당란에 체크하여 주시기 바랍니다)", styles["subtitle"]))
     story.append(_related_case_table(styles))
     story.extend(_section("기타사항", styles["heading"], 8))
     story.append(_paragraph_block("", styles["body"], 25))
+    story.append(_p("※ ①, ②항은 반드시 표시하여야 하며, 만일 본 고소내용과 동일한 사건 또는 관련 형사사건이 수사·재판 중이라면 어느 검찰청, 경찰서에서 수사 중인지, 어느 법원에서 재판 중인지 아는 범위에서 기타사항란에 기재하여야 합니다.", styles["small"]))
     story.extend(_section("8. 기타", styles["heading"], 8))
     story.append(_paragraph_block("", styles["body"], 26))
 
@@ -375,11 +446,13 @@ def build_complaint_pdf(payload: ComplaintGenerateRequest, complaint_text: str) 
     story.append(_p("※ 고소장은 가까운 경찰서에 제출하셔도 됩니다.", styles["small_center"]))
 
     if facts_needs_appendix:
-        _append_text_appendix(story, styles, "별지 1. 범죄사실", facts)
+        _append_text_appendix(story, styles, "별지 : 범죄사실", facts)
     if reason_needs_appendix:
-        _append_text_appendix(story, styles, "별지 2. 고소이유", reason)
+        _append_text_appendix(story, styles, "별지 : 고소이유", reason)
 
-    _append_evidence_annex(story, styles)
+    _append_evidence_annex(story, styles, payload)
+    if has_evidence:
+        _append_evidence_images(story, styles, payload)
 
     doc.build(story)
     return buffer.getvalue()

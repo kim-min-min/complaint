@@ -16,8 +16,3 @@ class UserResponse(BaseModel):
     # SQLAlchemy 모델 객체를 Pydantic에서 읽을 수 있게 설정 (2.0 버전 방식)
     model_config = ConfigDict(from_attributes=True)
 
-# 3. 토큰 정보와 사용자 정보를 한꺼번에 보낼 때
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    user: UserResponse

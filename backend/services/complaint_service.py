@@ -14,22 +14,15 @@ load_dotenv(ENV_PATH, override=True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("\ufeffOPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+DEFAULT_PURPOSE_TEXT = "저는 피고소인의 위 행위에 대하여 고소하오니 철저히 수사하여 법에 따라 처벌하여 주시기 바랍니다."
 
 SYSTEM_PROMPT = (
     "당신은 대한민국 형사 고소장 초안 작성 보조자입니다. "
-    "사실을 꾸미지 않고, 사용자가 입력한 내용만 근거로 제출 검토 가능한 문서 형식의 한국어 초안을 작성합니다."
+    "사실을 꾸미지 않고, 사용자가 입력한 내용만 근거로 고소인이 직접 제출하는 문서 형식의 한국어 초안을 작성합니다."
 )
 
 def _unknown(value: str, fallback: str = "미상") -> str:
     return value.strip() if value and value.strip() else fallback
-
-
-def _attachments_text(payload: ComplaintGenerateRequest) -> str:
-    if payload.attachments:
-        return "\n".join(f"{idx}. {item}" for idx, item in enumerate(payload.attachments, 1))
-    if payload.evidence_summary:
-        return "1. 증거자료 사본"
-    return "1. 증거자료 사본 (확보 시 제출)"
 
 
 def _legal_references_text(payload: ComplaintGenerateRequest) -> str:
@@ -38,46 +31,47 @@ def _legal_references_text(payload: ComplaintGenerateRequest) -> str:
     return "\n".join(f"- {item}" for item in payload.legal_references[:10])
 
 
+def _legal_reference_titles_text(payload: ComplaintGenerateRequest) -> str:
+    titles = []
+    for item in payload.legal_references[:10]:
+        for line in str(item or "").splitlines():
+            cleaned = line.strip()
+            if cleaned.startswith("판례:"):
+                titles.append(f"- {cleaned}")
+                break
+    return "\n".join(titles)
+
+
 def _purpose_text(payload: ComplaintGenerateRequest) -> str:
-    charge = _unknown(payload.charge_name, "○○죄")
-    return f"고소인은 피고소인을 {charge}로 고소하오니 처벌하여 주시기 바랍니다."
+    return DEFAULT_PURPOSE_TEXT
 
 
 def _build_prompt(payload: ComplaintGenerateRequest) -> str:
-    charge_instruction = (
-        f"- 3. 고소취지는 반드시 다음 문장으로만 작성하세요: {_purpose_text(payload)}"
-        if payload.charge_name and payload.charge_name.strip()
-        else "- 3. 고소취지는 반드시 다음 문장으로만 작성하세요: 고소인은 피고소인을 ○○죄로 고소하오니 처벌하여 주시기 바랍니다."
-    )
+    charge_instruction = f"- 3. 고소취지는 반드시 다음 문장으로만 작성하세요: {_purpose_text(payload)}"
     return f"""
-아래 사용자의 진술만 근거로 대한민국 형사 고소장 초안을 작성하세요.
+아래 사용자의 진술과 보완 답변만 근거로 대한민국 형사 고소장 초안을 작성하세요.
 
-출력 형식 규칙:
-- 마크다운 기호(**, ###, ---)를 절대 쓰지 마세요.
-- 아래 번호와 제목을 그대로 사용하세요: 고 소 장, 1. 고소인, 2. 피고소인, 3. 고소취지, 4. 범죄사실, 5. 고소이유, 6. 증거자료
-- 사용자가 제공하지 않은 사실을 만들지 마세요.
-- 모르는 개인정보는 '미상'으로만 표시하세요. '추후 보완 예정' 문구는 쓰지 마세요.
-- AI가 죄명, 혐의명, 관련 법조를 새로 판단하거나 추가하지 마세요.
-- 고소 죄명이 입력된 경우, 3. 고소취지와 5. 고소이유에서 그 죄명만 사용하세요.
-- 고소 죄명과 다른 죄명 표현은 사용하지 마세요.
-- 사용자가 입력한 표현에 다른 죄명처럼 보이는 단어가 있더라도, 이를 법적 죄명으로 단정하지 말고 구체적 행위 사실로 풀어 쓰세요.
+출력 형식:
+- 마크다운 기호(**, ###, ---)를 쓰지 마세요.
+- 제목은 그대로 사용하세요: 고 소 장, 1. 고소인, 2. 피고소인, 3. 고소취지, 4. 범죄사실, 5. 고소이유, 6. 증거자료
+- 제공되지 않은 사실은 만들지 말고, 모르는 개인정보는 '미상'으로 표시하세요.
+- 죄명, 혐의명, 관련 법조를 새로 판단하지 말고, 죄명처럼 보이는 표현도 구체적 행위 사실 중심으로 풀어 쓰세요.
+- 고소장은 제3자 보고서가 아니라 본인이 직접 제출하는 문서처럼 작성하세요.
+- 본문에서는 가능한 한 '저는', '제가', '저에게', '피고소인은'을 사용하고, '고소인은', '피해자는' 같은 제3자 표현은 되도록 쓰지 마세요.
 {charge_instruction}
 
 작성 규칙:
-- 4. 범죄사실에는 사용자가 입력한 사실만 시간 순서에 맞게 정리하세요.
-- 4. 범죄사실에서 빠진 사실을 추측하거나 만들어 쓰지 마세요.
-- 5. 고소이유에는 범죄사실을 뒷받침하는 경위, 정황, 고소 동기, 피해 내용을 정리하세요.
-- 5. 고소이유는 사용자를 계속 주어로 세우는 주장문이 아니라, 사건 경위와 정황을 중심으로 자연스럽게 작성하세요.
-- 판례의 적용 여부, 유죄 가능성, 범죄 성립 여부를 단정하지 마세요.
-- “명백합니다”, “해당합니다”, “입증됩니다”, “보여줍니다”, “판례에 따르면” 같은 단정 표현을 쓰지 마세요.
-- 관련 법조, 형법 조문, 특정 죄명 섹션은 만들지 마세요.
-- 마지막 알림 문구는 쓰지 마세요. 서비스 화면에서 별도로 안내합니다.
+- 4. 범죄사실에는 일시, 장소, 행위 방법, 피해 결과를 시간 순서대로 구체적으로 정리하세요.
+- 5. 고소이유에는 범행 경위, 정황, 피해 내용, 고소하게 된 이유를 본인이 겪은 사실 중심으로 정리하세요.
+- 법적 판단, 유죄 가능성, 판례 적용 여부를 단정하지 마세요.
+- 마지막 알림 문구는 쓰지 마세요.
 
-보완 답변 및 참고판례 처리 규칙:
-- 아래 “전 단계 보완 답변 및 선택 참고판례”에는 사용자의 보완 답변과 선택한 참고판례 정보가 함께 들어 있습니다.
-- “고소이유 보완” 아래의 질문/답변은 사용자가 추가로 제공한 사실입니다.
-- 질문/답변 내용은 5. 고소이유에 자연스럽게 반영하세요.
-- 선택 참고판례 정보는 초안 본문에 작성하지 마세요.
+보완 답변 반영 규칙:
+- 보완 질문/답변은 내용에 따라 4. 범죄사실 또는 5. 고소이유에 나누어 반영하세요.
+- 침입·접근 방식, 협박·폭행 방법, 사용한 물건, 역할 분담, 피해 물품, 신고 경위처럼 사건 진행을 구체화하는 내용은 4. 범죄사실에 반영하세요.
+- 범행 전후 정황, 피해가 계속되는 사정, 불안감·공포감, 고소하게 된 이유는 5. 고소이유에 반영하세요.
+- 같은 사실을 4. 범죄사실과 5. 고소이유에 길게 반복하지 마세요.
+- 선택 참고판례 정보는 초안 본문에 작성하지 말고, 참고판례의 죄명이나 사실관계를 현재 사건에 가져오지 마세요.
 
 입력 정보:
 고소인 성명: {payload.complainant_name}
@@ -125,14 +119,14 @@ def _fallback_complaint(payload: ComplaintGenerateRequest) -> str:
     3. 고소취지
     {purpose}
 
-    4. 범죄 사실
+    4. 범죄사실
     발생 일시: {_unknown(payload.incident_date)}
     발생 장소: {_unknown(payload.incident_location)}
     {payload.incident_description}
 
     5. 고소이유
-    피고소인의 행위 경위와 정황, 고소를 하게 된 동기와 사유는 위 범죄사실 기재 내용과 같습니다.
-    {("※ 참고판례\n" + _legal_references_text(payload)) if payload.legal_references else ""}
+    저는 위 범죄사실과 같은 피고소인의 행위로 피해를 입었고, 이에 대해 수사를 통해 사실관계가 확인되기를 원합니다.
+    {("※ 참고판례\n" + _legal_reference_titles_text(payload)) if payload.legal_references else ""}
 
     6. 증거자료
     {_unknown(payload.evidence_summary, '별도 기재 없음')}
@@ -224,7 +218,12 @@ def _sanitize_complaint_text(text: str, allowed_charge: str = "") -> str:
                 cleaned = cleaned.replace(pattern, "피고소인의 행위")
         cleaned = cleaned.replace("피고소인을 피고소인의 행위로", "피고소인의 행위에 대하여")
         sanitized_lines.append(cleaned)
-    return "\n".join(sanitized_lines).strip()
+    return _normalize_purpose_section("\n".join(sanitized_lines)).strip()
+
+
+def _normalize_purpose_section(text: str) -> str:
+    pattern = r"(?P<head>(?:^|\n)\s*3\.\s*고소취지\s*\n)(?P<body>.*?)(?=\n\s*4\.\s*범죄\s*사실|\n\s*4\.\s*범죄사실|\Z)"
+    return re.sub(pattern, lambda match: f"{match.group('head')}{DEFAULT_PURPOSE_TEXT}\n", text, count=1, flags=re.S)
 
 def _extract_openai_text(data: dict) -> str:
     choices = data.get("choices") or []

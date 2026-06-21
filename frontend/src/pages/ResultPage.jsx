@@ -19,7 +19,6 @@ const EMPTY_FINAL_FIELDS = {
   policeStation: '',
   filingDate: '',
   chargeName: '',
-  attachments: '',
 };
 
 function formatApiError(data, fallback) {
@@ -38,9 +37,8 @@ function extractSection(text, number, fallback = '') {
   return (match?.[1] || fallback).trim();
 }
 
-function defaultPurpose(chargeName) {
-  const charge = String(chargeName || '').trim() || '○○죄';
-  return `고소인은 피고소인을 ${charge}로 고소하오니 처벌하여 주시기 바랍니다.`;
+function defaultPurpose() {
+  return '저는 피고소인의 위 행위에 대하여 고소하오니 철저히 수사하여 법에 따라 처벌하여 주시기 바랍니다.';
 }
 
 function formatReferenceText(references) {
@@ -50,8 +48,6 @@ function formatReferenceText(references) {
     .map((item) => {
       const lines = item.split('\n').map((line) => line.trim()).filter(Boolean);
       const precedent = lines.find((line) => line.startsWith('판례:'));
-      const issue = lines.find((line) => line.startsWith('쟁점:'));
-      if (precedent && issue) return `- ${precedent}\n  ${issue}`;
       if (precedent) return `- ${precedent}`;
       return '';
     })
@@ -77,23 +73,42 @@ function appendReferenceText(reason, references) {
   return `${base}\n\n※ 참고판례\n${referenceText}`.trim();
 }
 
+function evidenceListText(items) {
+  return (items || [])
+    .map((item) => item.name?.trim())
+    .filter(Boolean)
+    .map((name, index) => `${index + 1}. ${name}`)
+    .join('\n');
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      resolve(result.includes(',') ? result.split(',').pop() : result);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
 function cleanOtherSection(value) {
   const text = String(value || '').trim();
   if (['(비워둠)', '비워둠', '없음'].includes(text)) return '';
   return text;
 }
 
-function parseDraftSections(text, references = [], chargeName = '') {
+function parseDraftSections(text, references = []) {
   return {
-    purpose: defaultPurpose(chargeName),
+    purpose: defaultPurpose(),
     facts: extractSection(text, 4),
     reason: appendReferenceText(extractSection(text, 5), references),
-    evidence: stripReferenceSection(extractSection(text, 6)),
     other: cleanOtherSection(extractSection(text, 7)),
   };
 }
 
-function composeComplaintText(originalText, sections) {
+function composeComplaintText(originalText, sections, evidenceText = '') {
   const complainant = extractSection(originalText, 1);
   const accused = extractSection(originalText, 2);
   return [
@@ -115,7 +130,7 @@ function composeComplaintText(originalText, sections) {
     sections.reason,
     '',
     '6. 증거자료',
-    sections.evidence,
+    evidenceText,
     '',
     '7. 기타',
     sections.other,
@@ -132,8 +147,9 @@ export default function ResultPage() {
   const reasonImprovementItems = location.state?.reasonImprovementItems || [];
   const [complaintText] = useState(location.state?.complaint_text || '');
   const [missingFields] = useState(location.state?.missing_fields || []);
-  const [draftSections, setDraftSections] = useState(() => parseDraftSections(location.state?.complaint_text || '', selectedReferences, selectedChargeName));
+  const [draftSections, setDraftSections] = useState(() => parseDraftSections(location.state?.complaint_text || '', selectedReferences));
   const [finalFields, setFinalFields] = useState({ ...EMPTY_FINAL_FIELDS, chargeName: selectedChargeName });
+  const [evidenceItems, setEvidenceItems] = useState([]);
   const [downloadingPdf, setDownloadingPdf] = useState(false);
   const [error, setError] = useState('');
 
@@ -147,7 +163,54 @@ export default function ResultPage() {
     setDraftSections((prev) => ({ ...prev, [name]: value }));
   };
 
-  const currentComplaintText = composeComplaintText(complaintText, draftSections);
+  const handleAddEvidence = () => {
+    if (evidenceItems.length >= 10) {
+      setError('증거자료는 최대 10개까지 첨부할 수 있습니다.');
+      return;
+    }
+    setEvidenceItems((prev) => [...prev, {
+      id: `${Date.now()}-${prev.length}`,
+      name: '',
+      filename: '',
+      contentType: '',
+      dataBase64: '',
+    }]);
+  };
+
+  const handleEvidenceNameChange = (id, value) => {
+    setEvidenceItems((prev) => prev.map((item) => (item.id === id ? { ...item, name: value } : item)));
+  };
+
+  const handleEvidenceFileChange = async (id, file) => {
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setError('증거자료 이미지는 jpg, png, webp 등 이미지 파일만 첨부할 수 있습니다.');
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      setError('이미지 1개당 최대 10MB까지 첨부할 수 있습니다.');
+      return;
+    }
+    const dataBase64 = await fileToBase64(file);
+    setEvidenceItems((prev) => prev.map((item) => (
+      item.id === id
+        ? {
+            ...item,
+            name: item.name || file.name.replace(/\.[^.]+$/, ''),
+            filename: file.name,
+            contentType: file.type,
+            dataBase64,
+          }
+        : item
+    )));
+  };
+
+  const handleRemoveEvidence = (id) => {
+    setEvidenceItems((prev) => prev.filter((item) => item.id !== id));
+  };
+
+  const evidenceText = evidenceListText(evidenceItems);
+  const currentComplaintText = composeComplaintText(complaintText, draftSections, evidenceText);
 
   const buildPayload = () => ({
     complainant_name: initialFormData.complainantName || '',
@@ -155,7 +218,7 @@ export default function ResultPage() {
     incident_date: initialFormData.incidentDate || '',
     incident_location: initialFormData.incidentLocation || '',
     incident_description: draftSections.facts || initialFormData.incidentDescription || '',
-    evidence_summary: draftSections.evidence || initialFormData.evidenceSummary || '',
+    evidence_summary: evidenceText,
     requested_punishment: '',
     charge_name: finalFields.chargeName,
     legal_references: selectedReferences,
@@ -170,7 +233,15 @@ export default function ResultPage() {
     accused_identifier: finalFields.accusedIdentifier,
     police_station: finalFields.policeStation,
     filing_date: finalFields.filingDate,
-    attachments: finalFields.attachments.split('\n').map((item) => item.trim()).filter(Boolean),
+    attachments: evidenceItems.map((item) => item.name.trim()).filter(Boolean),
+    evidence_attachments: evidenceItems
+      .filter((item) => item.name.trim() && item.dataBase64)
+      .map((item) => ({
+        name: item.name.trim(),
+        filename: item.filename,
+        content_type: item.contentType,
+        data_base64: item.dataBase64,
+      })),
   });
 
   useEffect(() => {
@@ -257,7 +328,7 @@ export default function ResultPage() {
               <div>
                 <p className="text-sm font-semibold text-slate-500">고 소 장</p>
                 <h2 className="mt-1 text-xl font-bold text-slate-950">AI 초안 수정</h2>
-                <p className="mt-2 text-sm leading-6 text-slate-500">고소취지, 범죄사실, 고소이유는 제출 전 사실관계에 맞게 직접 수정하세요.</p>
+                <p className="mt-2 text-sm leading-6 text-slate-500">고소취지, 범죄사실, 고소이유는 제출 전 본인이 직접 진술하는 문장으로 확인하세요.</p>
               </div>
               <DraftTextArea label="3. 고소취지" name="purpose" value={draftSections.purpose} onChange={handleDraftChange} rows={4} />
               <div>
@@ -272,7 +343,7 @@ export default function ResultPage() {
                 )}
               </div>
               <div>
-                <DraftTextArea label="5. 고소이유" name="reason" value={draftSections.reason} onChange={handleDraftChange} rows={8} helper="범행 경위, 정황, 고소하게 된 사유를 간략하고 명확하게 정리하세요." />
+                <DraftTextArea label="5. 고소이유" name="reason" value={draftSections.reason} onChange={handleDraftChange} rows={8} helper="범행 경위, 정황, 피해 내용, 고소하게 된 이유를 본인이 겪은 사실 중심으로 정리하세요." />
                 {reasonImprovementItems.length > 0 && (
                   <div className="mt-3 rounded-md border border-blue-200 bg-blue-50 px-4 py-3">
                     <p className="text-sm font-bold text-blue-950">고소이유 보완 포인트</p>
@@ -282,7 +353,13 @@ export default function ResultPage() {
                   </div>
                 )}
               </div>
-              <DraftTextArea label="6. 증거자료" name="evidence" value={draftSections.evidence} onChange={handleDraftChange} rows={4} />
+              <EvidenceAttachments
+                items={evidenceItems}
+                onAdd={handleAddEvidence}
+                onNameChange={handleEvidenceNameChange}
+                onFileChange={handleEvidenceFileChange}
+                onRemove={handleRemoveEvidence}
+              />
               <DraftTextArea label="7. 기타" name="other" value={draftSections.other} onChange={handleDraftChange} rows={4} helper="특별히 추가할 내용이 없으면 비워두세요." />
             </div>
           </section>
@@ -315,10 +392,6 @@ export default function ResultPage() {
                 <Field label="피고소인 기타사항" name="accusedIdentifier" value={finalFields.accusedIdentifier} onChange={handleFinalChange} />
                 <Field label="제출 관서" name="policeStation" value={finalFields.policeStation} onChange={handleFinalChange} placeholder="예: 서울강남경찰서" />
                 <Field label="제출일" name="filingDate" value={finalFields.filingDate} onChange={handleFinalChange} placeholder="예: 2026. 05. 10." />
-                <label className="block">
-                  <span className="mb-1 block text-sm font-semibold text-slate-700">첨부서류</span>
-                  <textarea name="attachments" value={finalFields.attachments} onChange={handleFinalChange} rows={3} placeholder="예: 송금내역 사본, 온라인 캡처, 진단서" className="w-full resize-y rounded-md border border-slate-300 px-3 py-2 text-sm leading-6 outline-none transition focus:border-blue-600 focus:ring-2 focus:ring-blue-100" />
-                </label>
               </div>
 
               {error && <div className="mt-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
@@ -357,6 +430,65 @@ function DraftTextArea({ label, helper, ...props }) {
       {helper && <span className="mb-2 block text-xs leading-5 text-slate-500">{helper}</span>}
       <textarea {...props} className="w-full resize-y rounded-md border border-slate-300 px-3 py-2 font-serif text-sm leading-7 text-slate-900 outline-none transition focus:border-blue-600 focus:ring-2 focus:ring-blue-100" />
     </label>
+  );
+}
+
+function EvidenceAttachments({ items, onAdd, onNameChange, onFileChange, onRemove }) {
+  return (
+    <section className="block">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div>
+          <h3 className="text-base font-bold text-slate-900">6. 증거자료</h3>
+          <p className="mt-1 text-xs leading-5 text-slate-500">제출할 증거의 이름을 적고 이미지를 첨부하세요. PDF에는 증거목록과 별지 이미지가 반영됩니다.</p>
+        </div>
+        <button type="button" onClick={onAdd} className="shrink-0 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-100">
+          추가
+        </button>
+      </div>
+
+      {items.length === 0 ? (
+        <div className="rounded-md border border-dashed border-slate-300 bg-slate-50 px-4 py-5 text-sm text-slate-500">
+          첨부할 증거자료가 있으면 추가 버튼을 눌러 등록하세요.
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {items.map((item, index) => (
+            <div key={item.id} className="rounded-md border border-slate-200 bg-slate-50 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-sm font-bold text-slate-700">증거 {index + 1}</span>
+                <button type="button" onClick={() => onRemove(item.id)} className="text-sm font-semibold text-red-600 hover:text-red-700">
+                  삭제
+                </button>
+              </div>
+              <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_220px]">
+                <label className="block">
+                  <span className="mb-1 block text-sm font-semibold text-slate-700">증거명</span>
+                  <input
+                    value={item.name}
+                    onChange={(event) => onNameChange(item.id, event.target.value)}
+                    placeholder="예: 송금내역, 채팅내역, CCTV 캡처"
+                    className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-blue-600 focus:ring-2 focus:ring-blue-100"
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-sm font-semibold text-slate-700">이미지 첨부</span>
+                  <span className="inline-flex cursor-pointer rounded-md bg-slate-900 px-3 py-2 text-sm font-bold text-white hover:bg-slate-800">
+                    파일 선택
+                  </span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(event) => onFileChange(item.id, event.target.files?.[0])}
+                    className="sr-only"
+                  />
+                </label>
+              </div>
+              {item.filename && <p className="mt-2 text-xs text-slate-500">첨부됨: {item.filename}</p>}
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 

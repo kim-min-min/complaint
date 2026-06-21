@@ -10,10 +10,6 @@ load_dotenv(ENV_PATH)
 APP_ENCRYPTION_KEY = os.getenv("APP_ENCRYPTION_KEY", "")
 
 
-def generate_encryption_key() -> str:
-    return Fernet.generate_key().decode("utf-8")
-
-
 def _fernet() -> Fernet:
     if not APP_ENCRYPTION_KEY:
         raise RuntimeError("APP_ENCRYPTION_KEY가 설정되지 않았습니다.")

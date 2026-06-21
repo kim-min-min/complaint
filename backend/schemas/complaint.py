@@ -1,4 +1,11 @@
-﻿from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field
+
+
+class EvidenceAttachment(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    filename: str = Field("", max_length=240)
+    content_type: str = Field("", max_length=80)
+    data_base64: str = Field("", max_length=15_000_000)
 
 
 class ComplaintGenerateRequest(BaseModel):
@@ -26,6 +33,7 @@ class ComplaintGenerateRequest(BaseModel):
     police_station: str = Field("", max_length=160)
     filing_date: str = Field("", max_length=80)
     attachments: list[str] = Field(default_factory=list, max_length=20)
+    evidence_attachments: list[EvidenceAttachment] = Field(default_factory=list, max_length=10)
 
 
 class ComplaintJobCreateResponse(BaseModel):
@@ -89,6 +97,7 @@ class SimilarPrecedentItem(BaseModel):
     id: str
     title: str
     charge: str = ""
+    charges: list[str] = Field(default_factory=list)
     source_url: str = ""
     issue: str = ""
     summary: str = ""
