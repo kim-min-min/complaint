@@ -77,7 +77,7 @@ export default function LandingPage() {
             <Feature
               number="01"
               title="사건 정리"
-              text="입력한 내용을 범죄사실과 증거관계로 나눕니다."
+              text="입력한 내용을 바탕으로 사건의 흐름과 핵심 쟁점을 정리합니다."
             />
             <Feature
               number="02"
@@ -100,7 +100,7 @@ export default function LandingPage() {
       </main>
 
       <footer className="border-t border-[#e1e3dc] px-5 py-8 sm:px-8 lg:px-10">
-        <div className="mx-auto flex max-w-7xl gap-5 text-sm text-[#64675f]">
+        <div className="mx-auto flex max-w-7xl justify-center gap-8 text-sm text-[#64675f]">
           <Link to="/terms" className="hover:text-[#111111]">이용약관</Link>
           <Link to="/privacy" className="hover:text-[#111111]">개인정보처리방침</Link>
         </div>
