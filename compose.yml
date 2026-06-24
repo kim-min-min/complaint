@@ -50,30 +50,16 @@ services:
         condition: service_healthy
     command: uvicorn main:app --host 0.0.0.0 --port 8000
 
-  frontend:
-    build:
-      context: ./frontend
-    container_name: complaint-frontend
-    restart: unless-stopped
-    environment:
-      VITE_API_BASE_URL: ""
-      VITE_PROXY_TARGET: http://backend:8000
-    ports:
-      - "5173:5173"
-    depends_on:
-      - backend
-    command: npm run dev -- --host 0.0.0.0
 
   nginx:
-    image: nginx:1.27-alpine
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
     container_name: complaint-nginx
     restart: unless-stopped
     ports:
       - "80:80"
-    volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
     depends_on:
-      - frontend
       - backend
 
   celery-worker:

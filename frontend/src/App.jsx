@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import LandingPage from './pages/LandingPage';
 import LoginPage from './pages/LoginPage';
@@ -11,34 +11,35 @@ import PrivacyPage from './pages/PrivacyPage';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
 
-function ProtectedRoute({ children }) {
-  const [status, setStatus] = useState('checking');
+async function fetchMe() {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/auth/me`, {
+      credentials: 'include',
+    });
 
-  useEffect(() => {
-    let ignore = false;
-
-    async function checkAuth() {
-      try {
-        const response = await fetch(`${API_BASE_URL}/api/auth/me`, {
-          credentials: 'include',
-        });
-        if (!ignore) setStatus(response.ok ? 'authenticated' : 'unauthenticated');
-      } catch {
-        if (!ignore) setStatus('unauthenticated');
-      }
+    if (!response.ok) {
+      return null;
     }
 
-    checkAuth();
-    return () => {
-      ignore = true;
-    };
-  }, []);
+    return response.json();
+  } catch {
+    return null;
+  }
+}
 
-  if (status === 'checking') {
+function ProtectedRoute({ children }) {
+  const { data: user, isLoading } = useQuery({
+    queryKey: ['me'],
+    queryFn: fetchMe,
+    retry: false,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  if (isLoading) {
     return <div className="min-h-screen bg-slate-50" />;
   }
 
-  if (status === 'unauthenticated') {
+  if (!user) {
     return <Navigate to="/login" replace />;
   }
 
